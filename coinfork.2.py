@@ -1,4 +1,4 @@
-Copy code
+
 import yfinance as yf
 import pandas as pd
 
@@ -94,7 +94,7 @@ print(f'Wins: {wins}, Losses: {losses}, Profit: {profit}')
 
 # show the details of all trades
 data[(data['entry_price']>0) & (data['exit_price']>0)][['entry_price','entry_time', 'exit_price','exit_time']].head()
-This code is incomplete and has errors, please note it will not execute successfully as is.
+
 
 
 
