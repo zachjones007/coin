@@ -1,93 +1,110 @@
+help me fix start_date = datetime.datetime(2023, 1, 1)
+end_date = datetime.datetime(2024, 1, 1)
 import yfinance as yf
+import backtrader as bt
+import ccxt
 import pandas as pd
 
-# get historical data for Fantom
-ftm = yf.Ticker("FTM-USD")
-data = ftm.history(period="max")
+# create an instance of the exchange object
+exchange = ccxt.binance()
 
-# calculate the short and long moving averages
-short_moving_average = data['Close'].rolling(window=5).mean()
-long_moving_average = data['Close'].rolling(window=20).mean()
+# define the symbol and timeframe
+symbol = 'BTC/USDT'
+timeframe = '1d'
 
-# create a new dataframe with the moving averages
-data = pd.DataFrame({'Close': data['Close'], 'short_moving_average': short_moving_average, 'long_moving_average': long_moving_average})
+# download the historical ohlcv bars
+ohlcv = exchange.fetch_ohlcv(symbol, timeframe)
 
-# determine the trading signals
-data['signal'] = None
-data.loc[(data['short_moving_average'] > data['long_moving_average']) & (data['short_moving_average'].shift(1) < data['long_moving_average'].shift(1)), 'signal'] = 'buy'
-data.loc[(data['short_moving_average'] < data['long_moving_average']) & (data['short_moving_average'].shift(1) > data['long_moving_average'].shift(1)), 'signal'] = 'sell'
+# convert the data to a pandas DataFrame
+data = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
-# initialize new columns to keep track of trades
-data['entry_price'] = None
-data['entry_time'] = None
-data['exit_price'] = None
-data['exit_time'] = None
-data['stop_loss'] = None
-data['stop_loss_triggered'] = None
+# set the timestamp as the DataFrame's index
+data.set_index('timestamp', inplace=True)
 
-# initialize trade statistics
-wins = 0
-losses = 0
-profit = 0
+# Create a subclass of the Backtrader Strategy class
+class MovingAverageCrossOver(bt.Strategy):
+    params = (
+        ('fast_period', 5),
+        ('slow_period', 20),
+        ('stop_loss_percent', 0.97),
+        ('take_profit_percent', 1.03),
+        ('stop_loss_trailing', True),
+        ('take_profit_trailing', True),
+        ('size', 1),
+        ('commision_percent', 0.01),
+        ('slippage_percent', 0.01)
+    )
 
-# set the stop-loss percentage
-stop_loss_percentage = 0.97
+    def __init__(self):
+        self.fast_ma = bt.indicators.SimpleMovingAverage(
+            self.data.close, period=self.params.fast_period)
+        self.slow_ma = bt.indicators.SimpleMovingAverage(
+            self.data.close, period=self.params.slow_period)
+        self.stop_loss = None
+        self.take_profit = None
 
-# iterate over the rows and record the entry/exit prices and times
-for i, row in data.iterrows():
-    if row['signal'] == 'buy':
-        data.loc[i, 'entry_time'] = row.name
-        # set the initial stop-loss at a fixed percentage of the entry price
-        data.loc[i, 'stop_loss'] = row['Close'] * stop_loss_percentage
-    elif row['signal'] == 'sell':
-        data.loc[i, 'exit_time'] = row.name
-        profit += (data.loc[i-1, 'exit_price'] - data.loc[i-1, 'entry_price']) / data.loc[i-1, 'entry_price']
-        wins += 1
-    else:
-        # check if the stop-loss needs to be adjusted
-        if data.loc[i, 'entry_time'] == row.name - pd.Timedelta(1, unit='d'):
+    def next(self):
+        position = self.position.size
+        if self.fast_ma > self.slow_ma:
+            if position < 0:
+                self.close()
+            elif position == 0:
+                size = int(self.params.size * (1 - self.params.commision_percent))
+                self.stop_loss = self.data.close * self.params.stop_loss_percent
+                self.take_profit = self.data.close * self.params.take_profit_percent
+                self.buy(size=size, exectype=bt.Order.Stop, price=self.stop_loss)
 
-        # check if the stop-loss was triggered
-          if row['Close'] <= data.loc[i-1, 'stop_loss']:
-            data.loc[i, 'stop_loss_triggered'] = True
-            losses += 1
+        elif self.fast_ma < self.slow_ma:
+            if position > 0:
+                self.close()
+            elif position == 0:
+                size = int(self.params.size * (1 - self.params.commision_percent))
+                
+    def log(self, txt, dt=None):
+        ''' Logging function fot this strategy'''
+        dt = dt or self.data.datetime[0]
+        if isinstance(dt, float):
+            dt = bt.num2date(dt)
+        print('%s, %s' % (dt.isoformat(), txt))
 
+def notify_order(self, order):
+    if order.status in [order.Submitted, order.Accepted]:
+        return
+    if order.status in [order.Completed]:
+        if order.isbuy():
+            self.log('BUY EXECUTED, Price: %.2f, Cost: %.2f, Comm %.2f' %
+            (order.executed.price,
+            order.executed.value,
+            order.executed.comm))
+        elif order.issell():
+            self.log('SELL EXECUTED, Price: %.2f, Cost: %.2f, Comm %.2f' %
+            (order.executed.price,
+            order.executed.value,
+            order.executed.comm))
+    elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+        self.log('Order Canceled/Margin/Rejected')
 
-# calculate the
+# Create an instance of the cerebro engine
+cerebro = bt.Cerebro()
 
+# Add the strategy to cerebro
+cerebro.addstrategy(MovingAverageCrossOver)
 
+# Create a Backtrader data feed from the pandas DataFrame
+data = bt.feeds.PandasData(dataname=data)
 
-# initialize new columns to keep track of trades
-data['entry_price'] = None
-data['entry_time'] = None
-data['exit_price'] = None
-data['exit_time'] = None
+# Add the data feed to cerebro
+cerebro.adddata(data)
 
-# check if the stop-loss was triggered
-if row['Close'] <= data.loc[i-1, 'stop_loss']:
-        data.loc[i, 'stop_loss_triggered'] = True
-        losses += 1
+# Set the start and end date of the strategy
+start_date = datetime.datetime(2023, 1, 1)
+end_date = datetime.datetime(2024, 1, 1)
+cerebro.broker.set_cash(100000)
 
-# calculate the profit/loss
-data['profit_loss'] = (data['exit_price'] - data['entry_price']) / data['entry_price']
+# Run the strategy
+cerebro.run()
 
-# print trade statistics
-print(f'Wins: {wins}, Losses: {losses}, Profit: {profit}')
-
-# show the details of all trades
-data[(data['entry_price']>0) & (data['exit_price']>0)][['entry_price','entry_time', 'exit_price','exit_time']].head()
-
-# calculate the profit/loss
-data['profit_loss'] = (data['exit_price'] - data['entry_price']) / data['entry_price']
-
-# print trade statistics
-print(f'Wins: {wins}, Losses: {losses}, Profit: {profit}')
-
-# show the details of all trades
-data[(data['entry_price']>0) & (data['exit_price']>0)][['entry_price','entry_time', 'exit_price','exit_time']].head()
-
-
-
+print(data)
 
 
 
