@@ -17,18 +17,21 @@ data = ftm.history(period="max")
 # you'll likely want to use an API or web scraping to obtain the actual text of the articles or statements in your actual implementation
 statements = ["The Federal Reserve is committed to maintaining price stability and supporting the economic recovery.", "The Federal Reserve is concerned about rising inflation and may raise interest rates."]
 scores = [sia.polarity_scores(statement) for statement in statements]
-print(scores)
+
+# assign sentiment scores to the historical data DataFrame
+data['sentiment'] = [scores[i % len(scores)] for i in range(len(data))]
 
 # calculate the short and long moving averages
 short_moving_average = data['Close'].rolling(window=5).mean()
 long_moving_average = data['Close'].rolling(window=20).mean()
 
 # create a new dataframe with the moving averages and sentiment scores
-data = pd.DataFrame({'Close': data['Close'], 'short_moving_average': short_moving_average, 'long_moving_average': long_moving_average, 'sentiment': scores})
+data = pd.DataFrame({'Close': data['Close'], 'short_moving_average': short_moving_average, 'long_moving_average': long_moving_average, 'sentiment': data['sentiment']})
+
 # determine the trading signals
 data['signal'] = None
-data.loc[(data['short_moving_average'] > data['long_moving_average']) & (data['short_moving_average'].shift(1) < data['long_moving_average'].shift(1)) & (data['sentiment'] > 0.5), 'signal'] = 'buy'
-data.loc[(data['short_moving_average'] < data['long_moving_average']) & (data['short_moving_average'].shift(1) > data['long_moving_average'].shift(1)) & (data['sentiment'] < 0.5), 'signal'] = 'sell'
+data.loc[(data['short_moving_average'] < data['long_moving_average']) & (data['short_moving_average'].shift(1) > data['long_moving_average'].shift(1)) & (data['sentiment'].apply(lambda x: x['compound']) < 0.5), 'signal'] = 'sell'
+data.loc[(data['short_moving_average'] > data['long_moving_average']) & (data['short_moving_average'].shift(1) < data['long_moving_average'].shift(1)) & (data['sentiment'].apply(lambda x: x['compound']) > 0.5), 'signal'] = 'buy'
 
 # initialize trade statistics
 wins = 0
@@ -49,4 +52,4 @@ for i, row in data.iterrows():
 data['profit_loss'] = (data['exit_price'] - data['entry_price']) / data['entry_price']
 
 # print trade statistics
-print(f'Wins: {wins}, Losses: {losses}')
+print(f'Wins : {wins}, Losses: {losses}')
