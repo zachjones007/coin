@@ -2,6 +2,8 @@ import yfinance as yf
 import pandas as pd
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
 
 # download the required resource vader_lexicon
 nltk.download('vader_lexicon')
@@ -21,35 +23,39 @@ scores = [sia.polarity_scores(statement) for statement in statements]
 # assign sentiment scores to the historical data DataFrame
 data['sentiment'] = [scores[i % len(scores)] for i in range(len(data))]
 
-# calculate the short and long moving averages
-short_moving_average = data['Close'].rolling(window=5).mean()
-long_moving_average = data['Close'].rolling(window=20).mean()
+# Create a new column for the label, 1 for an increase in price and 0 for a decrease
+data['label'] = (data['Close'] > data['Close'].shift(1)).astype(int)
 
-# create a new dataframe with the moving averages and sentiment scores
-data = pd.DataFrame({'Close': data['Close'], 'short_moving_average': short_moving_average, 'long_moving_average': long_moving_average, 'sentiment': data['sentiment']})
+# Create a feature dataset, dropping unnecessary columns
+features = data[['sentiment', 'label']]
 
-# determine the trading signals
-data['signal'] = None
-data.loc[(data['short_moving_average'] < data['long_moving_average']) & (data['short_moving_average'].shift(1) > data['long_moving_average'].shift(1)) & (data['sentiment'].apply(lambda x: x['compound']) < 0.5), 'signal'] = 'sell'
-data.loc[(data['short_moving_average'] > data['long_moving_average']) & (data['short_moving_average'].shift(1) < data['long_moving_average'].shift(1)) & (data['sentiment'].apply(lambda x: x['compound']) > 0.5), 'signal'] = 'buy'
+# Split the dataset into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(features.drop(columns=['label']), features['label'], test_size=0.2)
 
-# initialize trade statistics
-wins = 0
-losses = 0
+# Initialize the machine learning model
+log_reg = LogisticRegression()
 
-# iterate over the rows and record the entry/exit prices
-for i, row in data.iterrows():
-    if row['signal'] == 'buy':
-        data.loc[i, 'entry_price'] = row['Close']
-    elif row['signal'] == 'sell':
-        data.loc[i, 'exit_price'] = row['Close']
-        if (data.loc[i, 'exit_price'] - data.loc[i, 'entry_price']) > 0:
-            wins += 1
-        else:
-            losses += 1
+# assign sentiment scores to the historical data DataFrame
+data['sentiment'] = [scores[i % len(scores)] for i in range(len(data))]
 
-# calculate the profit/loss
-data['profit_loss'] = (data['exit_price'] - data['entry_price']) / data['entry_price']
+# extract compound sentiment value from dictionaries and add as new column
+data['compound_sentiment'] = data['sentiment'].apply(lambda x: x['compound'])
 
-# print trade statistics
-print(f'Wins : {wins}, Losses: {losses}')
+# Create a new column for the label, 1 for an increase in price and 0 for a decrease
+data['label'] = (data['Close'] > data['Close'].shift(1)).astype(int)
+
+# Create a feature dataset, dropping unnecessary columns
+features = data[['compound_sentiment', 'label']]
+
+# Split the dataset into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(features.drop(columns=['label']), features['label'], test_size=0.2)
+
+# Initialize the machine learning model
+log_reg = LogisticRegression()
+
+# Fit the model to the training data
+log_reg.fit(X_train, y_train)
+
+# Evaluate the model on the test data
+accuracy = log_reg.score(X_test, y_test)
+print(f'Accuracy of model : {accuracy*100}%')
