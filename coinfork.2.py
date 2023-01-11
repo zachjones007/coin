@@ -17,21 +17,21 @@ ohlcv.set_index('timestamp', inplace=True)
 ohlcv = ohlcv.resample('15T').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'})
 
 class MovingAverageCrossOver(bt.Strategy):
-params = (
-('fast_period', 5),
-('slow_period', 20)
-)
-def init(self):
-self.fast_ma = bt.indicators.SimpleMovingAverage(self.data.close, period=self.params.fast_period)
-self.slow_ma = bt.indicators.SimpleMovingAverage(self.data.close, period=self.params.slow_period)
+    params = (
+        ('fast_period', 5),
+        ('slow_period', 20)
+    )
+    def __init__(self):
+        self.fast_ma = bt.indicators.SimpleMovingAverage(self.data.close, period=self.params.fast_period)
+        self.slow_ma = bt.indicators.SimpleMovingAverage(self.data.close, period=self.params.slow_period)
 
+    def next(self):
+        position = self.position.size
+        if self.fast_ma[0] > self.slow_ma[0] and position <= 0:
+            self.buy()
+        elif self.fast_ma[0] < self.slow_ma[0] and position >= 0:
+            self.close()
 
-def next(self):
-    position = self.position.size
-    if self.fast_ma > self.slow_ma and position <= 0:
-        self.buy()
-    elif self.fast_ma < self.slow_ma and position >= 0:
-        self.close()
 #Create an instance of cerebro
 cerebro = bt.Cerebro()
 
@@ -42,7 +42,7 @@ data = bt.feeds.PandasData(dataname=ohlcv)
 cerebro.adddata(data)
 
 #Add the strategy to cerebro
-cerebro.addstrategy(MovingAverageCrossOver)
+cerebro.addstrategy(MovingAverageCrossOver, fast_period=5, slow_period=20)
 
 cerebro.broker.setcash(100000.0)
 
@@ -57,7 +57,6 @@ cerebro.run()
 
 #Print out the final result
 print('Final Portfolio Value: %.2f' % cerebro.broker.getvalue())
-
 
 
 
