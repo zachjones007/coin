@@ -1,4 +1,3 @@
-
 import yfinance as yf
 import pandas as pd
 
@@ -37,22 +36,19 @@ stop_loss_percentage = 0.97
 # iterate over the rows and record the entry/exit prices and times
 for i, row in data.iterrows():
     if row['signal'] == 'buy':
-        data.loc[i, 'entry_price'] = row['Close']
         data.loc[i, 'entry_time'] = row.name
         # set the initial stop-loss at a fixed percentage of the entry price
         data.loc[i, 'stop_loss'] = row['Close'] * stop_loss_percentage
     elif row['signal'] == 'sell':
-        data.loc[i, 'exit_price'] = row['Close']
         data.loc[i, 'exit_time'] = row.name
         profit += (data.loc[i-1, 'exit_price'] - data.loc[i-1, 'entry_price']) / data.loc[i-1, 'entry_price']
         wins += 1
     else:
         # check if the stop-loss needs to be adjusted
-        if row['Close'] > data.loc[i-1, 'stop_loss']:
-            data.loc[i, 'stop_loss'] = row['Close'] * stop_loss_percentage
+        if data.loc[i, 'entry_time'] == row.name - pd.Timedelta(1, unit='d'):
 
         # check if the stop-loss was triggered
-        if row['Close'] <= data.loc[i-1, 'stop_loss']:
+          if row['Close'] <= data.loc[i-1, 'stop_loss']:
             data.loc[i, 'stop_loss_triggered'] = True
             losses += 1
 
@@ -61,11 +57,6 @@ for i, row in data.iterrows():
 
 
 
-zach@cti-az.com
-can you print the code from where it left off no need to print the beginning 
-Sure, here is the rest of the code:
-
-Copy code
 # initialize new columns to keep track of trades
 data['entry_price'] = None
 data['entry_time'] = None
@@ -94,6 +85,8 @@ print(f'Wins: {wins}, Losses: {losses}, Profit: {profit}')
 
 # show the details of all trades
 data[(data['entry_price']>0) & (data['exit_price']>0)][['entry_price','entry_time', 'exit_price','exit_time']].head()
+
+
 
 
 
