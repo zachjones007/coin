@@ -1,20 +1,9 @@
-import datetime
-import ccxt
+import yfinance as yf
 import pandas as pd
 import backtrader as bt
 
-#create an instance of the exchange object
-exchange = ccxt.binance({'rateLimit': 3000, 'enableRateLimit': True})
-
-#define the symbol and timeframe
-symbol = 'BTC/USDT'
-timeframe = '1m'
-
-#download the historical ohlcv bars
-ohlcv = exchange.fetch_ohlcv(symbol, timeframe)
-ohlcv = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-ohlcv.set_index('timestamp', inplace=True)
-ohlcv = ohlcv.resample('15T').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'})
+btc_data = yf.download("BTC-USD", start="2015-01-01", end="2020-01-01")
+print(btc_data.head())
 
 class MovingAverageCrossOver(bt.Strategy):
     params = (
@@ -36,7 +25,7 @@ class MovingAverageCrossOver(bt.Strategy):
 cerebro = bt.Cerebro()
 
 #Create a Backtrader data feed from the pandas DataFrame
-data = bt.feeds.PandasData(dataname=ohlcv)
+data = bt.feeds.PandasData(dataname=btc_data)
 
 #Add the data feed to cerebro
 cerebro.adddata(data)
@@ -57,6 +46,4 @@ cerebro.run()
 
 #Print out the final result
 print('Final Portfolio Value: %.2f' % cerebro.broker.getvalue())
-
-
 
