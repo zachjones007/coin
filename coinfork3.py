@@ -2,16 +2,11 @@ import yfinance as yf
 import pandas as pd
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
 
-# download required NLTK resources
+# download the required resource vader_lexicon
 nltk.download('vader_lexicon')
-
-def print_sentiment(compound_score):
-    if compound_score > 0:
-        print("good")
-    else:
-        print("bad")
-
 
 # create SentimentIntensityAnalyzer object
 sia = SentimentIntensityAnalyzer()
@@ -20,62 +15,43 @@ sia = SentimentIntensityAnalyzer()
 ftm = yf.Ticker("FTM-USD")
 data = ftm.history(period="max")
 
-# calculate the short and long moving averages
-short_moving_average = data['Close'].rolling(window=5).mean()
-long_moving_average = data['Close'].rolling(window=20).mean()
+# analyze the sentiment of news articles or statements made by the Federal Reserve
+# you'll likely want to use an API or web scraping to obtain the actual text of the articles or statements in your actual implementation
+statements = ["The Federal Reserve is committed to maintaining price stability and supporting the economic recovery.", "The Federal Reserve is concerned about rising inflation and may raise interest rates."]
+scores = [sia.polarity_scores(statement) for statement in statements]
 
-# create a new dataframe with the moving averages
-data = pd.DataFrame({'Close': data['Close'], 'short_moving_average': short_moving_average, 'long_moving_average': long_moving_average})
+# Initialize the machine learning model
+log_reg = LogisticRegression()
 
-# determine the trading signals
-data['signal'] = None
-data.loc[(data['short_moving_average'] > data['long_moving_average']) & (data['short_moving_average'].shift(1) < data['long_moving_average'].shift(1)), 'signal'] = 'buy'
-data.loc[(data['short_moving_average'] < data['long_moving_average']) & (data['short_moving_average'].shift(1) > data['long_moving_average'].shift(1)), 'signal'] = 'sell'
+# assign sentiment scores to the historical data DataFrame
+data['sentiment'] = [scores[i % len(scores)] for i in range(len(data))]
 
-# Extract last time buy and sell signals went off 
-last_buy_signal = data[data['signal']=='buy'].index[-1]
-last_sell_signal = data[data['signal']=='sell'].index[-1]
+# extract compound sentiment value from dictionaries and add as new column
+data['compound_sentiment'] = data['sentiment'].apply(lambda x: x['compound'])
 
-# initialize new columns to keep track of trades
-data['entry_price'] = None
-data['exit_price'] = None
+# Add RSI column
+delta = data['Close'].diff()
+gain = delta.where(delta > 0, 0)
+loss = -delta.where(delta < 0, 0)
+avg_gain = gain.rolling(window=14).mean()
+avg_loss = loss.rolling(window=14).mean()
+rs = avg_gain / avg_loss
+data['RSI'] = 100 - (100 / (1 + rs))
 
-# iterate over the rows and record the entry/exit prices
-for i, row in data.iterrows():
-    if row['signal'] == 'buy':
-        data.loc[i, 'entry_price'] = row['Close']
-    elif row['signal'] == 'sell':
-        data.loc[i, 'exit_price'] = row['Close']
+# Create a new column for the label, 1 for an increase in price and 0 for a decrease
+data['label'] = (data['Close'] > data['Close'].shift(1)).astype(int)
 
-# calculate the profit/loss
-data['profit_loss'] = data['exit_price'] - data['entry_price']
+# Create a feature dataset, dropping unnecessary columns
+features = data[['compound_sentiment', 'RSI']]
 
-# set the initial stop-loss at a fixed percentage of the entry price
-stop_loss = 0.8 # 80% of the entry price
+# Split the dataset into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(features.drop(columns=['label']), features['label'], test_size=0.2)
 
-for i, row in data.iterrows():
-    if row['signal'] == 'buy':
-        data.loc[i, 'entry_price'] = row['Close']
-        data.loc[i, 'stop_loss'] = row['Close'] * stop_loss
-    elif row['signal'] == 'sell':
-        data.loc[i, 'exit_price'] = row['Close']
-    elif row['Close'] > data.loc[i, 'stop_loss']:
-        
-# iterate over the buy trades and calculate the profit/loss
-for i, row in buy_data.iterrows():
-    exit_index = sell_data[sell_data.index > i].index[0]
-    data.loc[exit_index, 'profit_loss'] = (data.loc[exit_index, 'exit_price'] - row['entry_price'])/row['entry_price']
+log_reg.fit(X_train, y_train)
+data['predictions'] = log_reg.predict(X_test)
+data['win'] = (data['label'] == data['predictions']).astype(int)
 
-# select the last 3 buy trades
-last_3_buy_trades = buy_data.tail(3)
-
-# iterate over the last 3 buy trades and print the information
-for i, row in last_3_buy_trades.iterrows():
-    print(f'Trade: {i}, Entry Price: {row["entry_price"]}, Exit Price: {data.loc[row.name, "exit_price"]}, Profit/Loss: {data.loc[row.name, "profit_loss"]}')
-
-# select the last 3 sell trades
-last_3_sell_trades = sell_data.tail(3)
-
-# iterate over the last 3 sell trades and print the information
-for i, row in last_3_sell_trades.iterrows():
-    print(f'Trade: {i}, Entry Price: {data.loc[row.name, "entry_price"]}, Exit Price: {row["exit_price"]}, Profit/Loss: {data.loc[row.name, "profit_loss"]}')
+win_percentage = data['win'].mean()
+print(win_percentage)
+print(data.tail())
+print(X_test.head())
