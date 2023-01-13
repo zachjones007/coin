@@ -1,49 +1,89 @@
+#0.7457928657531738
 import yfinance as yf
 import pandas as pd
-import backtrader as bt
+from transformers import BertTokenizer, BertForSequenceClassification, AdamW
+from torch.utils.data import TensorDataset, DataLoader, random_split
+from torch.utils.data.sampler import RandomSampler
+import torch
+from transformers import get_linear_schedule_with_warmup
+from tqdm import trange
 
-btc_data = yf.download("BTC-USD", start="2015-01-01", end="2020-01-01")
-print(btc_data.head())
+# Fetch historical data for Fantom
+ftm = yf.Ticker("FTM-USD")
+data = ftm.history(period="max")
 
-class MovingAverageCrossOver(bt.Strategy):
-    params = (
-        ('fast_period', 5),
-        ('slow_period', 20)
-    )
-    def __init__(self):
-        self.fast_ma = bt.indicators.SimpleMovingAverage(self.data.close, period=self.params.fast_period)
-        self.slow_ma = bt.indicators.SimpleMovingAverage(self.data.close, period=self.params.slow_period)
+# Preprocess the data to extract relevant information for your classification task
+# This will likely involve cleaning and transforming the data
+# You can use pandas to do this
 
-    def next(self):
-        position = self.position.size
-        if self.fast_ma[0] > self.slow_ma[0] and position <= 0:
-            self.buy()
-        elif self.fast_ma[0] < self.slow_ma[0] and position >= 0:
-            self.close()
+# Load the pre-trained BERT model and tokenizer
+model = BertForSequenceClassification.from_pretrained("bert-base-uncased")
+tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
-#Create an instance of cerebro
-cerebro = bt.Cerebro()
+# Prepare your labeled dataset of sentences and their corresponding labels
+# You can use any dataset of your choice, this is just an example
+sentences = ["This is a positive sentence.", "This is a negative sentence.", "This is a neutral sentence."]
+labels = [1, 0, 2]  # 1 for positive, 0 for negative, 2 for neutral
 
-#Create a Backtrader data feed from the pandas DataFrame
-data = bt.feeds.PandasData(dataname=btc_data)
+# Convert the dataset to input format for BERT
+input_ids = [tokenizer.encode(sent, add_special_tokens=True) for sent in sentences]
+attention_masks = [[float(i>0) for i in sent] for sent in input_ids]
+labels = torch.tensor(labels)
 
-#Add the data feed to cerebro
-cerebro.adddata(data)
+# Split the dataset into training and validation sets
+train_data, val_data = random_split(TensorDataset(torch.tensor(input_ids).long(), torch.tensor(attention_masks).long(), labels), [int(0.8 * len(input_ids)), len(input_ids) - int(0.8 * len(input_ids))])
 
-#Add the strategy to cerebro
-cerebro.addstrategy(MovingAverageCrossOver, fast_period=5, slow_period=20)
+batch_size = 16  # Assign a value for batch_size
+num_train_epochs = 10  # Assign a value for number of training epochs
+device = "cpu"  # Assign a value for device, can be "cpu" or "cuda"
 
-cerebro.broker.setcash(100000.0)
+# Create an iterator of our data with torch DataLoader
+train_dataloader = DataLoader(train_data, sampler=RandomSampler(train_data), batch_size=batch_size)
+val_dataloader = DataLoader(val_data, batch_size=batch_size)
 
-#Set the commission - 0.1% ... divide by 100 to remove the %
-cerebro.broker.setcommission(commission=0.001)
+# Define the optimizer and scheduler
+optimizer = AdamW(model.parameters(), lr=2e-5, eps=1e-8)
+scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=-1)
 
-#Print out the starting conditions
-print('Starting Portfolio Value: %.2f' % cerebro.broker.getvalue())
+# Train the model
+model.train()
+for _ in trange(int(num_train_epochs), desc="Epoch"):
+    tr_loss = 0
+    nb_tr_examples, nb_tr_steps = 0, 0
+    for step, batch in enumerate(train_dataloader):
+        # Add batch to device
+        batch = tuple(t.to(device) for t in batch)
+        # Unpack the inputs from our dataloader
+        b_input_ids, b_attention_masks, b_labels = batch
+        # Clear out the gradients (by default they accumulate)
+        optimizer.zero_grad()
+        # Forward pass
+        outputs = model(b_input_ids, attention_mask=b_attention_masks, labels=b_labels)
+        loss = outputs[0]
+        # Backward pass and optimization
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        # Update tracking variables
+        tr_loss += loss.item()
+        nb_tr_examples += b_input_ids.size(0)
+        nb_tr_steps += 1
+    print("Train loss: {}".format(tr_loss/nb_tr_steps))
 
-#Run the strategy
-cerebro.run()
-
-#Print out the final result
-print('Final Portfolio Value: %.2f' % cerebro.broker.getvalue())
+# Evaluation loop
+model.eval()
+eval_loss, eval_accuracy = 0, 0
+nb_eval_steps, nb_eval_examples = 0, 0
+for batch in val_dataloader:
+    # Add batch to device
+    batch = tuple(t.to(device) for t in batch)
+    # Unpack the inputs from our dataloader
+    b_input_ids, b_attention_masks, b_labels = batch
+    # Forward pass
+    with torch.no_grad():
+        outputs = model(b_input_ids, attention_mask=b_attention_masks, labels=b_labels)
+        tmp_eval_loss, logits = outputs[:2]
+        eval_loss += tmp_eval_loss.mean().item()
+    nb_eval_steps += 1
+print("Validation Loss: {}".format(eval_loss/nb_eval_steps))
 
