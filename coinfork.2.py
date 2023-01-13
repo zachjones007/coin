@@ -1,3 +1,4 @@
+i have defined 3 classes: positive, negative and neutral. However, the labels tensor only has 2 values can you fix this in the code? 
 #0.7457928657531738
 import yfinance as yf
 import pandas as pd
