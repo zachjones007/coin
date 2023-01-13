@@ -83,7 +83,8 @@ for batch in val_dataloader:
     with torch.no_grad():
         outputs = model(b_input_ids, attention_mask=b_attention_masks, labels=b_labels)
         tmp_eval_loss, logits = outputs[:2]
-        eval_loss += tmp_eval_loss.mean().item()
+        logits = logits.detach().cpu().numpy()
+        predictions = np.argmax(logits, axis=1)
+        eval_accuracy += accuracy_score(b_labels, predictions)
     nb_eval_steps += 1
-print("Validation Loss: {}".format(eval_loss/nb_eval_steps))
-
+print("Validation Accuracy: {}".format(eval_accuracy / nb_eval_steps))
