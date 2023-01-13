@@ -1,4 +1,4 @@
-#54-65(record)
+#53-65
 # Import necessary libraries
 import yfinance as yf
 import pandas as pd
@@ -13,8 +13,8 @@ data = ftm.history(period="max")
 delta = data['Close'].diff()
 gain = delta.where(delta > 0, 0)
 loss = -delta.where(delta < 0, 0)
-avg_gain = gain.rolling(window=14).mean()
-avg_loss = loss.rolling(window=14).mean()
+avg_gain = gain.rolling(window=12).mean()
+avg_loss = loss.rolling(window=12).mean()
 rs = avg_gain / avg_loss
 data['RSI'] = 100 - (100 / (1 + rs))
 
@@ -44,6 +44,22 @@ y_pred = log_reg.predict(X_test)
 # Evaluate the model's performance using accuracy score
 from sklearn.metrics import accuracy_score
 acc = accuracy_score(y_test, y_pred)
+# Add the last 10 trades to the dataframe
+data['win_or_lose'] = 'N/A'
+data['entry_price'] = 'N/A'
+
+last_ten_rows = data.tail(10)
+for i in range(len(last_ten_rows)):
+    if last_ten_rows['Close'][i] > last_ten_rows['Close'][i-1]:
+        data.at[i, 'win_or_lose'] = 'win'
+        data.at[i, 'entry_price'] = last_ten_rows['Open'][i]
+    else:
+        data.at[i, 'win_or_lose'] = 'lose'
+        data.at[i, 'entry_price'] = last_ten_rows['Open'][i]
+
+
+# Print the last 10 rows of the dataframe
+print(data.tail(10))
 print(acc)
 print(f"Shape of features dataframe: {features.shape}")
 print(f"Missing values in features dataframe: {features.isna().sum()}")
