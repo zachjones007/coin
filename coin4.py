@@ -1,3 +1,4 @@
+
 #53-65
 # Import necessary libraries
 import yfinance as yf
@@ -57,9 +58,19 @@ for i in range(len(last_ten_rows)):
         data.at[i, 'win_or_lose'] = 'lose'
         data.at[i, 'entry_price'] = last_ten_rows['Open'][i]
 
+# Add the take profit function
+current_price = ftm.info["regularMarketPrice"]
+for i in range(len(last_ten_rows)):
+    if data.at[i, 'win_or_lose'] == 'win':
+        take_profit_price = data.at[i, 'entry_price'] * 1.03
+        if current_price >= take_profit_price:
+            print("Take profit reached! Selling FTM at", current_price)
+
+# Print the last 10 rows of the dataframe
+print(data.tail(10))
 
 # Print the last 10 rows of the dataframe
 print(data.tail(10))
 print(acc)
-print(f"Shape of features dataframe: {features.shape}")
+
 print(f"Missing values in features dataframe: {features.isna().sum()}")
