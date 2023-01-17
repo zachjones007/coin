@@ -1,5 +1,4 @@
 
-#53-65
 # Import necessary libraries
 import yfinance as yf
 import pandas as pd
@@ -64,8 +63,15 @@ for i in range(len(last_ten_rows)):
     if data.at[i, 'win_or_lose'] == 'win':
         take_profit_price = data.at[i, 'entry_price'] * 1.03
         if current_price >= take_profit_price:
-            print("Take profit reached! Selling FTM at", current_price)
-
+            print("Trade: ", data.at[i, 'win_or_lose'])
+            print("Entry Price: ",data.at[i, 'entry_price'])
+            print("Exit Price: ", current_price)
+    if data.at[i, 'win_or_lose'] == 'lose':
+        take_loss_price = data.at[i, 'entry_price'] * 0.97
+        if current_price <= take_loss_price:
+            print("Trade: ", data.at[i, 'win_or_lose'])
+            print("Entry Price: ",data.at[i, 'entry_price'])
+            print("Exit Price: ", current_price)
 # Print the last 10 rows of the dataframe
 print(data.tail(10))
 
@@ -73,4 +79,5 @@ print(data.tail(10))
 print(data.tail(10))
 print(acc)
 
+print(f"Missing values in features dataframe: {features.isna().sum()}")
 print(f"Missing values in features dataframe: {features.isna().sum()}")
