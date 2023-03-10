@@ -1,4 +1,3 @@
-#59%
 # Import necessary libraries
 import yfinance as yf
 import pandas as pd
@@ -61,3 +60,17 @@ log_reg.fit(X_train, y_train)
 # Test the model's performance on the testing data
 accuracy = log_reg.score(X_test, y_test)
 print("Accuracy: ", accuracy)
+
+# Predict the next day's label using the logistic regression model
+last_row = data.iloc[-1]
+next_day_features = [last_row['RSI'], scores[-1]]
+next_day_features = pd.DataFrame([next_day_features], columns=['RSI', 'sentiment'])
+next_day_features = next_day_features.fillna(features.mean())
+next_day_label = log_reg.predict(next_day_features)[0]
+
+# Print whether the market is bullish or bearish based on the predicted label
+if next_day_label == 1:
+    print("The market is bullish.")
+else:
+    print("The market is bearish.")
+
