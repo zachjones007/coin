@@ -1,0 +1,38 @@
+//@version=4
+study(title="Combined Indicators", overlay=false)
+
+// Inputs
+rsiLength = input(title="RSI Length", type=input.integer, defval=14)
+emaLength = input(title="EMA Length", type=input.integer, defval=20)
+bbLength = input(title="Bollinger Bands Length", type=input.integer, defval=20)
+bbStdDev = input(title="Bollinger Bands Standard Deviation", type=input.integer, defval=2)
+
+// RSI
+rsiValue = rsi(close, rsiLength)
+
+// EMA
+emaValue = ema(close, emaLength)
+
+// Bollinger Bands
+[smaValue, upperBB, lowerBB] = bb(close, bbLength, bbStdDev)
+bbWidth = (upperBB - lowerBB) / smaValue
+
+// Plot the new custom indicator
+plot(rsiValue + emaValue + bbWidth, color=color.green, linewidth=2)
+
+// Plot the overbought/oversold levels
+hline1 = hline(74, color=color.red)
+hline2 = hline(38, color=color.red)
+fill(hline1, hline2, color=color.red, transp=80)
+
+// Plot the Bollinger Bands
+p1 = plot(upperBB, color=color.blue)
+p2 = plot(smaValue, color=color.blue)
+p3 = plot(lowerBB, color=color.blue)
+fill(p1, p3, color=color.blue, transp=95)
+
+// Show order blocks on the chart
+obHL = input(title="Order Block Lookback Period", type=input.integer, defval=20)
+obRange = highest(high, obHL) - lowest(low, obHL)
+obValue = obRange * 0.3 + lowest(low, obHL)
+plot(obValue, color=color.gray, style=plot.style_line, title="Order Block")
