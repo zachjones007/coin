@@ -17,8 +17,11 @@ emaValue = ema(close, emaLength)
 [smaValue, upperBB, lowerBB] = bb(close, bbLength, bbStdDev)
 bbWidth = (upperBB - lowerBB) / smaValue
 
+// Multiply all indicators
+combinedValue = rsiValue * emaValue * bbWidth
+
 // Plot the new custom indicator
-plot(rsiValue + emaValue + bbWidth, color=color.green, linewidth=2)
+plot(combinedValue, color=color.green, linewidth=2)
 
 // Plot the overbought/oversold levels
 hline1 = hline(74, color=color.red)
@@ -36,3 +39,4 @@ obHL = input(title="Order Block Lookback Period", type=input.integer, defval=20)
 obRange = highest(high, obHL) - lowest(low, obHL)
 obValue = obRange * 0.3 + lowest(low, obHL)
 plot(obValue, color=color.gray, style=plot.style_line, title="Order Block")
+
