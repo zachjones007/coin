@@ -18,7 +18,7 @@ sell_bb = close < bb_lower
 
 // RSI Trend Reversal
 rsi_length = input(title="RSI Length", type=input.integer, defval=12)
-rsi_overbought = input(title="RSI Overbought", type=input.float, defval=70.3)
+rsi_overbought = input(title="RSI Overbought", type=input.float, defval=69.1)
 rsi_oversold = input(title="RSI Oversold", type=input.float, defval=60.667)
 rsi = rsi(close, rsi_length)
 buy_rsi = rsi < rsi_oversold
@@ -51,4 +51,3 @@ plot(rsi, color=color.purple, title="RSI")
 // plotshape(sell_ma, color=color.red, style=shape.arrowdown, location=location.abovebar)
 // plotshape(sell_bb, color=color.red, style=shape.triangledown, location=location.abovebar)
 // plotshape(sell_rsi, color=color.purple, style=shape.arrowdown, location=location.abovebar)
-
