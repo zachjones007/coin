@@ -3,7 +3,7 @@ strategy(title="Combined Trading Strategy", overlay=true, default_qty_type=strat
 
 // Moving Average Crossover
 ma_short_length = input(title="Short MA Length", type=input.integer, defval=65)
-ma_long_length = input(title="Long MA Length", type=input.integer, defval=180)
+ma_long_length = input(title="Long MA Length", type=input.integer, defval=170)
 ma_short = sma(close, ma_short_length)
 ma_long = sma(close, ma_long_length)
 buy_ma = crossover(ma_short, ma_long)
@@ -44,10 +44,3 @@ plot(bb_upper, color=color.red, title="Upper BB")
 plot(bb_lower, color=color.red, title="Lower BB")
 plot(rsi, color=color.purple, title="RSI")
 
-// Debug Info
-// plotshape(buy_ma, color=color.green, style=shape.arrowup, location=location.belowbar)
-// plotshape(buy_bb, color=color.green, style=shape.triangleup, location=location.belowbar)
-// plotshape(buy_rsi, color=color.purple, style=shape.arrowup, location=location.belowbar)
-// plotshape(sell_ma, color=color.red, style=shape.arrowdown, location=location.abovebar)
-// plotshape(sell_bb, color=color.red, style=shape.triangledown, location=location.abovebar)
-// plotshape(sell_rsi, color=color.purple, style=shape.arrowdown, location=location.abovebar)
