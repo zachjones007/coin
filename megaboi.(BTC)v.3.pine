@@ -24,9 +24,9 @@ rsi = rsi(close, rsi_length)
 buy_rsi = rsi < rsi_oversold
 sell_rsi = rsi > rsi_overbought
 
-// Stop Loss and Take Profit
+// Stop Loss and Trailing Stop Loss
 stop_loss_percentage = input(title="Stop Loss (%)", type=input.float, defval=2) / 100
-take_profit_percentage = input(title="Take Profit (%)", type=input.float, defval=4) / 100
+trailing_stop_loss_percentage = input(title="Trailing Stop Loss (%)", type=input.float, defval=4) / 100
 
 // Buy and Sell Conditions
 buy_condition = buy_ma or buy_rsi
@@ -35,12 +35,12 @@ sell_condition = sell_ma or sell_rsi
 // Trades
 if buy_condition
     strategy.entry("Buy", strategy.long)
-    strategy.exit("Exit Buy", "Buy", stop=close * (1 - stop_loss_percentage), limit=close * (1 + take_profit_percentage))
+    strategy.exit("Exit Buy", "Buy", stop=close * (1 - stop_loss_percentage), trail_points=close * trailing_stop_loss_percentage)
     
 if sell_condition
     strategy.close("Buy")
     strategy.entry("Sell", strategy.short)
-    strategy.exit("Exit Sell", "Sell", stop=close * (1 + stop_loss_percentage), limit=close * (1 - take_profit_percentage))
+    strategy.exit("Exit Sell", "Sell", stop=close * (1 + stop_loss_percentage), trail_points=close * trailing_stop_loss_percentage)
 
 // Plots
 plot(ma_short, color=color.blue, title="Short MA")
