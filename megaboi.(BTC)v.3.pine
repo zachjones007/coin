@@ -49,3 +49,4 @@ plot(bb_middle, color=color.orange, title="Middle BB")
 plot(bb_upper, color=color.red, title="Upper BB")
 plot(bb_lower, color=color.red, title="Lower BB")
 plot(rsi, color=color.purple, title="RSI")
+
