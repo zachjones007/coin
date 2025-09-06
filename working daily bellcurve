@@ -1,0 +1,172 @@
+"""
+btc_current_candle_predictor
+---------------------------------
+
+This script provides a simple prediction for the current Bitcoin (BTC) candle
+using a synthetic bell‑curve assumption.  It does **not** fetch or rely on
+option chains or historical multi‑day signals; instead, it uses the current
+spot price and an assumed volatility percentage to construct a normal
+distribution of possible price outcomes for the next candle.  The plot
+displays the distribution with inverted percentile labels (e.g., 10% of the
+mass corresponds to a 90% chance label) to aid readability.
+
+Rationale
+---------
+
+Financial options on Deribit are designed for expiry at specific dates and
+cannot predict the intraday candle directly.  For a quick estimate of
+near‑term price movement, this script assumes that returns follow a normal
+distribution over a short horizon (e.g. the next 30 minutes).  You can
+adjust the assumed volatility via the ``VOL_PCT`` constant; by default it
+is set to 1% (0.01) of the spot price.
+
+Usage
+-----
+
+Run the script as a standalone program to fetch the current BTC index price,
+generate a bell curve for the next candle, and display the plot along with
+key percentile levels.  If network access is unavailable, the script will
+fall back to a default spot of 1.0.
+
+Example::
+
+    python btc_current_candle_predictor.py
+
+"""
+
+import math
+from datetime import datetime, timezone
+from typing import Dict, Optional
+
+import numpy as np
+import requests
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# Assumed volatility for the next candle as a percentage of spot (e.g. 0.01 for 1%).
+VOL_PCT: float = 0.01
+
+# Deribit API endpoint and session
+DERIBIT = "https://www.deribit.com/api/v2"
+_session = requests.Session()
+_session.headers.update({"User-Agent": "btc-current-candle/1.0"})
+
+
+def fetch_btc_spot() -> float:
+    """Fetch the current BTC index price from Deribit.  Returns a float.
+
+    On failure, returns 1.0 as a fallback.  A network timeout of 10 seconds
+    is applied to avoid hanging indefinitely.
+    """
+    url = f"{DERIBIT}/public/get_index_price"
+    try:
+        resp = _session.get(url, params={"index_name": "btc_usd"}, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if "result" in data and "index_price" in data["result"]:
+            return float(data["result"]["index_price"])
+    except Exception:
+        pass
+    return 1.0
+
+
+def build_current_candle_distribution(vol_pct: float = VOL_PCT) -> Dict[str, float]:
+    """Compute and plot a synthetic bell curve for the current BTC candle.
+
+    Parameters
+    ----------
+    vol_pct : float, optional
+        Assumed volatility for the next candle as a fraction of the spot
+        price (default: 0.01 for 1%).
+
+    Returns
+    -------
+    Dict[str, float]
+        Dictionary containing spot price and key percentile levels.
+    """
+    # Fetch current spot; fallback to 1.0 if network fails
+    S0 = fetch_btc_spot()
+
+    # Use a synthetic normal distribution with mean S0 and sigma = vol_pct * S0
+    sigma = abs(S0) * vol_pct if abs(S0) > 0 else 1.0 * vol_pct
+    # Generate a range around the mean (±4 sigma covers ~99.9937% of mass)
+    x = np.linspace(S0 - 4.0 * sigma, S0 + 4.0 * sigma, 900)
+    pdf = norm.pdf(x, loc=S0, scale=sigma)
+    # Normalize the PDF to integrate to 1
+    pdf /= np.trapz(pdf, x)
+    cdf = norm.cdf(x, loc=S0, scale=sigma)
+
+    # Percentile levels
+    p05 = np.interp(0.05, cdf, x)
+    p10 = np.interp(0.10, cdf, x)
+    p30 = np.interp(0.30, cdf, x)
+    p50 = np.interp(0.50, cdf, x)
+    p70 = np.interp(0.70, cdf, x)
+    p90 = np.interp(0.90, cdf, x)
+    p95 = np.interp(0.95, cdf, x)
+
+    # Plot the distribution
+    plt.figure(figsize=(10, 5))
+    plt.fill_between(x, pdf, 0, where=(x >= p05) & (x <= p95), alpha=0.20,
+                     label=f"5–95%: {p05:,.2f}–{p95:,.2f}")
+    plt.fill_between(x, pdf, 0, where=(x >= p10) & (x <= p90), alpha=0.35,
+                     label=f"10–90%: {p10:,.2f}–{p90:,.2f}")
+    plt.plot(x, pdf, linewidth=1.6)
+
+    def vline(xv: float, text: str, color: str = 'grey') -> None:
+        plt.axvline(xv, linestyle=':', linewidth=1.6, color=color, alpha=0.9)
+        ymax = plt.ylim()[1]
+        plt.text(xv, ymax * 0.92, text, rotation=90, va="top", ha="right")
+
+    # Inverted probability labels
+    vline(p10, f"90% chance {p10:,.2f}")
+    vline(p30, f"70% chance {p30:,.2f}")
+    vline(p50, f"50% chance {p50:,.2f}", color='black')
+    vline(p70, f"30% chance {p70:,.2f}")
+    vline(p90, f"10% chance {p90:,.2f}")
+
+    plt.axvline(S0, color="k", linewidth=1.2, alpha=0.6)
+    plt.text(S0, plt.ylim()[1] * 0.98, f"Spot {S0:,.2f}", ha="center", va="top")
+
+    plt.title(f"BTC Current Candle Prediction (vol={vol_pct*100:.1f}% of spot)")
+    plt.xlabel("BTC Price (USD)")
+    plt.ylabel("Probability Density")
+    plt.grid(True, alpha=0.25)
+    plt.legend(loc="upper right")
+    # Tighten x-limits around the support of the PDF
+    support_mask = pdf > pdf.max() * 0.002
+    if support_mask.any():
+        xmin, xmax = x[support_mask][0], x[support_mask][-1]
+        span = xmax - xmin
+        plt.xlim(xmin - 0.05 * span, xmax + 0.05 * span)
+    plt.tight_layout()
+    plt.show()
+
+    return {
+        "spot": S0,
+        "p05": p05,
+        "p10": p10,
+        "p30": p30,
+        "p50": p50,
+        "p70": p70,
+        "p90": p90,
+        "p95": p95,
+    }
+
+
+if __name__ == "__main__":
+    # Compute and display the current candle distribution
+    summary = build_current_candle_distribution()
+    print(
+        f"Spot: {summary['spot']:.2f}\n"
+        f"10th percentile (90% chance): {summary['p10']:.2f}\n"
+        f"30th percentile (70% chance): {summary['p30']:.2f}\n"
+        f"Median (50% chance): {summary['p50']:.2f}\n"
+        f"70th percentile (30% chance): {summary['p70']:.2f}\n"
+        f"90th percentile (10% chance): {summary['p90']:.2f}"
+    )
