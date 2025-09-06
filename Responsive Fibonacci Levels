@@ -1,0 +1,25 @@
+//@version=5
+indicator("Responsive Fibonacci Levels", overlay=true)
+
+// ——— Inputs
+length = input.int(50, title="Lookback Period")
+showFib = input.bool(true, title="Show Fibonacci Levels")
+
+// ——— Dynamic high/low range
+recentHigh = ta.highest(high, length)
+recentLow  = ta.lowest(low, length)
+priceRange = recentHigh - recentLow
+
+// ——— Fibonacci Levels
+level_0    = recentLow
+level_236  = recentLow + priceRange * 0.236
+level_786  = recentLow + priceRange * 0.786
+level_1    = recentHigh
+
+
+// ——— Plotting
+plot(showFib ? level_0    : na, title="0.0%",   color=color.yellow)
+plot(showFib ? level_236  : na, title="23.6%",  color=color.yellow)
+plot(showFib ? level_786  : na, title="78.6%",  color=color.yellow)
+plot(showFib ? level_1    : na, title="100%",   color=color.yellow)
+
