@@ -1,4 +1,165 @@
-from __future__ import annotations
+from scipy.stats import norm
+
+def build_daily_bell_and_guard(
+    guard: DailyRiskGuard,
+    start_equity_today: Optional[float] = None,
+    position: Optional[object] = None,
+    risk_free_rate: float = 0.0,
+    strike_window_pct: float = 0.40,
+    min_calls: int = 16,
+    bell_sigma_pts: float = 4.0,
+    save_png: Optional[str] = None,
+) -> Dict[str, float]:
+    """
+    Compute and plot the risk-neutral PDF (from Deribit options when available),
+    falling back to a synthetic bell curve (normal distribution) when network/data
+    are unavailable. Annotates 10/30/50/70/90% cum. levels with *inverted* labels:
+    90% at p10, 70% at p30, 50% at p50, 30% at p70, 10% at p90.
+    """
+    if start_equity_today is not None:
+        guard.set_start_equity(start_equity_today)
+
+    use_synthetic = False
+
+    try:
+        # ----- Real options path -----
+        S0 = fetch_btc_spot()
+        exp_ms, calls, puts = choose_good_expiry(min_calls=min_calls)
+        T = time_to_expiry_years(exp_ms)
+        exp_ts = datetime.fromtimestamp(exp_ms / 1000.0, tz=timezone.utc)
+
+        # Build call curve within ±strike_window_pct around spot
+        k_lo, k_hi = (1.0 - strike_window_pct) * S0, (1.0 + strike_window_pct) * S0
+        K, C = build_call_curve(calls, puts, S0, r=risk_free_rate, T=T, strike_window=(k_lo, k_hi))
+
+        # Densify strike grid and compute PDF via BL
+        grid = np.linspace(K.min(), K.max(), 900)
+        pre = UnivariateSpline(K, C, k=3, s=max(1e-6, len(K) * 1e-3))
+        Cg = pre(grid)
+        x, pdf = bl_pdf_from_calls(grid, Cg, r=risk_free_rate, T=T, smoothing_scale=1e-3)
+        pdf = gaussian_smooth(pdf, sigma_pts=bell_sigma_pts)
+        area = np.trapz(pdf, x)
+        if area > 0:
+            pdf /= area
+        cdf = cdf_from_pdf(x, pdf)
+
+    except Exception:
+        # ----- Synthetic fallback path (no network/data) -----
+        use_synthetic = True
+        try:
+            S0 = fetch_btc_spot()
+        except Exception:
+            S0 = 1.0  # final fallback anchor
+        exp_ts = datetime.utcnow()
+
+        # 30% "vol" around S0 for a visible bell curve
+        sigma = abs(S0) * 0.30 if abs(S0) > 0 else 1.0
+        x = np.linspace(S0 - 4.0 * sigma, S0 + 4.0 * sigma, 900)
+        pdf = norm.pdf(x, loc=S0, scale=sigma)
+        pdf /= np.trapz(pdf, x)
+        cdf = norm.cdf(x, loc=S0, scale=sigma)
+
+    # Percentiles & mass at spot
+    p05 = percentile_level(x, cdf, 0.05)
+    p10 = percentile_level(x, cdf, 0.10)
+    p25 = percentile_level(x, cdf, 0.25)
+    p30 = percentile_level(x, cdf, 0.30)
+    p50 = percentile_level(x, cdf, 0.50)
+    p70 = percentile_level(x, cdf, 0.70)
+    p75 = percentile_level(x, cdf, 0.75)
+    p90 = percentile_level(x, cdf, 0.90)
+    p95 = percentile_level(x, cdf, 0.95)
+    cdf_at_spot = float(np.interp(S0, x, cdf))
+
+    # Bias/TP/SL (works in both real & synthetic modes)
+    bias, tp_level, sl_level = suggest_trade_levels(
+        S0, p05, p25, p50, p75, p95,
+        tol=0.002,
+        cdf_at_spot=cdf_at_spot,
+        edge_cdf=0.01,
+    )
+
+    # Risk guard update
+    if position is not None:
+        try:
+            upl = position.upl(S0)
+        except Exception:
+            upl = 0.0
+        guard.set_unrealized_pnl(upl)
+        guard.check_lock()
+
+    # -------- Plot --------
+    plt.figure(figsize=(10, 6))
+    # Shaded bands
+    plt.fill_between(x, pdf, 0, where=(x >= p05) & (x <= p95), alpha=0.20,
+                     label=f"5–95%: {p05:,.0f}–{p95:,.0f}")
+    plt.fill_between(x, pdf, 0, where=(x >= p25) & (x <= p75), alpha=0.35,
+                     label=f"25–75%: {p25:,.0f}–{p75:,.0f}")
+    # Curve
+    plt.plot(x, pdf, linewidth=1.6)
+
+    def vline(xv: float, ls: str, text: str, color: str = 'black') -> None:
+        plt.axvline(xv, linestyle=ls, linewidth=1.6, alpha=0.9, color=color)
+        ymax = plt.ylim()[1]
+        plt.text(xv, ymax * 0.92, text, rotation=90, va="top", ha="right")
+
+    # Median & spot
+    vline(p50, "--", f"Median ${p50:,.0f}")
+    plt.axvline(S0, color="k", linewidth=1.2, alpha=0.6)
+    plt.text(S0, plt.ylim()[1] * 0.98, f"Spot ${S0:,.0f}", ha="center", va="top")
+
+    # TP/SL (skip if no directional bias)
+    if bias != "NEUTRAL":
+        if tp_level is not None:
+            vline(tp_level, "-", f"TP ${tp_level:,.0f}")
+        if sl_level is not None:
+            vline(sl_level, "-", f"SL ${sl_level:,.0f}")
+
+    # Inverted probability labels for readability
+    vline(p10, ":", f"90% chance ${p10:,.0f}", color='grey')
+    vline(p30, ":", f"70% chance ${p30:,.0f}", color='grey')
+    vline(p70, ":", f"30% chance ${p70:,.0f}", color='grey')
+    vline(p90, ":", f"10% chance ${p90:,.0f}", color='grey')
+
+    src = "Synthetic" if use_synthetic else "Options"
+    plt.title(f"BTC PDF — {src} — Exp {exp_ts.strftime('%Y-%m-%d')} — Day {guard.day or guard._today_iso(guard.tz_offset_hours)}")
+    plt.xlabel("BTC price (USD)")
+    plt.ylabel("Probability density (relative likelihood)")
+    plt.grid(True, alpha=0.25)
+    plt.legend(loc="upper right", frameon=True)
+
+    # Keep x-limits tight to the support of the curve
+    support_mask = pdf > pdf.max() * 0.002
+    if support_mask.any():
+        xmin, xmax = x[support_mask][0], x[support_mask][-1]
+        span = xmax - xmin
+        plt.xlim(xmin - 0.05 * span, xmax + 0.05 * span)
+
+    plt.tight_layout()
+    if save_png:
+        plt.savefig(save_png, dpi=150)
+    plt.show()
+
+    return {
+        "spot": S0,
+        "p05": p05,
+        "p10": p10,
+        "p25": p25,
+        "p30": p30,
+        "p50": p50,
+        "p70": p70,
+        "p75": p75,
+        "p90": p90,
+        "p95": p95,
+        "bias": bias,
+        "tp": tp_level,
+        "sl": sl_level,
+        "locked": guard.locked,
+        "drawdown_from_start": guard._drawdown_from_start(),
+        "realized_pnl": guard.realized_pnl,
+        "unrealized_pnl": guard.unrealized_pnl,
+    }
+
 
 """
 btc_daily_pdf_guard_backtest
@@ -19,7 +180,8 @@ Key features:
 
 * **Bell curve visualization**: The PDF is smoothed with a Gaussian
   kernel, plotted with shaded 5‑95% and 25‑75% bands, and annotated with
-  the spot price, median, TP and SL levels.
+  the spot price, median, TP and SL levels.  Additionally, this version
+  annotates the 30%, 50%, 70% and 90% cumulative probability levels.
 
 * **Bias, TP and SL**: Chooses a long/short bias based on the PDF.  The
   function ``suggest_trade_levels`` considers both the PDF’s median
@@ -57,7 +219,6 @@ Run this script once per trading day (ideally before the New York close)
 to generate the PDF, log the signal, and grade any previous signals.  It
 stores its state in ``btc_daily_guard_state.json`` and
 ``btc_daily_signals.jsonl`` within the current working directory.
-
 """
 
 import os
@@ -81,17 +242,12 @@ except ImportError:
     yf = None  # type: ignore
     pd = None  # type: ignore
 
+# Constants and file paths
 DERIBIT = "https://www.deribit.com/api/v2"
 SIGNALS_PATH = "btc_daily_signals.jsonl"
 STATE_PATH   = "btc_daily_guard_state.json"
 
 # Local CSV file containing Coinbase Bitcoin (CBBTCUSD) closing prices.
-# This file should contain two columns: ``observation_date`` (YYYY‑MM‑DD) and
-# ``CBBTCUSD`` (closing price).  It can be downloaded from FRED
-# (https://fred.stlouisfed.org/series/CBBTCUSD) and placed alongside this
-# script.  If present, it will be used to compute actual closing prices
-# corresponding to each day’s predicted median when generating the
-# predicted‑vs‑actual table.
 BTC_PRICE_CSV = "CBBTCUSD.csv"
 
 
@@ -100,16 +256,9 @@ BTC_PRICE_CSV = "CBBTCUSD.csv"
 ###############################################################################
 
 # QuoteRow: simple record for an option quote
-#
-# Deribit returns call and put strikes along with bid and ask prices.  We
-# convert these into mid quotes and store them in a QuoteRow object.  This
-# dataclass is used throughout the script to type‑hint lists of quotes and
-# ensure each quote has numeric strike ``K`` and mid price ``mid``.
-
 @dataclass
 class QuoteRow:
     """A container for a single option quote.
-
     Attributes
     ----------
     K : float
@@ -157,9 +306,9 @@ def _deribit_get(path: str, retries: int = 3, backoff: float = 0.6, **params) ->
                 raise last_err  # re-raise final exception
 
 
-# ---------------------------------------------------------------------------
+###############################################################################
 # Daily Risk Guard
-# ---------------------------------------------------------------------------
+###############################################################################
 
 @dataclass
 class DailyRiskGuard:
@@ -230,28 +379,12 @@ class DailyRiskGuard:
         return self.locked
 
 
-# ---------------------------------------------------------------------------
+###############################################################################
 # Persistence helpers
-# ---------------------------------------------------------------------------
+###############################################################################
 
 def load_guard(path: str) -> Optional[DailyRiskGuard]:
-    """Load a DailyRiskGuard from a JSON file, if it exists.
-
-    The guard's state (day, equity, PnL, locked status) is stored in a
-    JSON file between script runs.  If the file does not exist, return
-    ``None`` so that a fresh guard can be created.
-
-    Parameters
-    ----------
-    path : str
-        The path to the JSON file to load.
-
-    Returns
-    -------
-    Optional[DailyRiskGuard]
-        A new DailyRiskGuard initialised from the file, or ``None``
-        if the file does not exist.
-    """
+    """Load a DailyRiskGuard from a JSON file, if it exists."""
     if not os.path.exists(path):
         return None
     try:
@@ -263,15 +396,7 @@ def load_guard(path: str) -> Optional[DailyRiskGuard]:
 
 
 def save_guard(path: str, guard: DailyRiskGuard) -> None:
-    """Save a DailyRiskGuard to a JSON file.
-
-    Parameters
-    ----------
-    path : str
-        The path to the JSON file to write.
-    guard : DailyRiskGuard
-        The guard to serialize.
-    """
+    """Save a DailyRiskGuard to a JSON file."""
     try:
         with open(path, "w") as f:
             json.dump(asdict(guard), f, indent=2)
@@ -279,9 +404,9 @@ def save_guard(path: str, guard: DailyRiskGuard) -> None:
         pass
 
 
-# ---------------------------------------------------------------------------
+###############################################################################
 # Option chain helpers
-# ---------------------------------------------------------------------------
+###############################################################################
 
 def fetch_btc_spot() -> float:
     """Return the Deribit BTC index price."""
@@ -358,12 +483,7 @@ def build_call_curve(
     T: float,
     strike_window: Tuple[float, float],
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Return a sorted strike array and corresponding call mids.
-
-    Real call quotes are merged with parity‑derived call mids from puts.  Any
-    tiny negative values (from noise) are clipped at zero.  Only strikes
-    within the specified window are returned.
-    """
+    """Return a sorted strike array and corresponding call mids."""
     Ks_calls = np.array([c.K for c in calls], float)
     Cs_calls = np.array([c.mid for c in calls], float)
     all_K = np.unique(np.concatenate([Ks_calls, np.array([p.K for p in puts], float)]))
@@ -395,13 +515,7 @@ def bl_pdf_from_calls(
     T: float,
     smoothing_scale: float = 1e-3,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute the Breeden–Litzenberger PDF: f(K) = e^{rT} * d²C/dK².
-
-    A cubic spline with gentle smoothing is used to obtain the second
-    derivative.  The smoothing scale increases when data are sparse to
-    prevent over‑fitting.  The resulting density is normalized to
-    integrate to 1.  A minimum of 8 strikes is required.
-    """
+    """Compute the Breeden–Litzenberger PDF: f(K) = e^{rT} * d²C/dK²."""
     n = len(strikes)
     if n < 8:
         raise RuntimeError(f"Too few strikes ({n}) to compute PDF.")
@@ -416,7 +530,7 @@ def bl_pdf_from_calls(
 
 
 def gaussian_smooth(y: np.ndarray, sigma_pts: float = 4.0) -> np.ndarray:
-    """Apply a Gaussian kernel to smooth the PDF, defined in index space."""
+    """Apply a Gaussian kernel to smooth the PDF."""
     if sigma_pts <= 0:
         return y
     radius = int(max(3, round(6 * sigma_pts)))
@@ -438,12 +552,7 @@ def percentile_level(x: np.ndarray, cdf: np.ndarray, p: float) -> float:
 
 
 def choose_good_expiry(min_calls: int = 16) -> Tuple[int, List[QuoteRow], List[QuoteRow]]:
-    """Pick the nearest expiry with at least ``min_calls`` call quotes.
-
-    If none of the upcoming expiries meet ``min_calls``, fall back to one
-    with at least 10 calls, emitting a warning.  Raises if no expiry has
-    more than 10 calls.
-    """
+    """Pick the nearest expiry with at least ``min_calls`` call quotes."""
     expiries = list_btc_expiries()
     for exp in expiries:
         calls, puts = fetch_chain(exp)
@@ -459,9 +568,9 @@ def choose_good_expiry(min_calls: int = 16) -> Tuple[int, List[QuoteRow], List[Q
     raise RuntimeError("No upcoming expiry has enough call quotes (>=10).")
 
 
-# ---------------------------------------------------------------------------
+###############################################################################
 # Bias / TP / SL logic
-# ---------------------------------------------------------------------------
+###############################################################################
 
 def suggest_trade_levels(
     spot: float,
@@ -474,17 +583,7 @@ def suggest_trade_levels(
     cdf_at_spot: Optional[float] = None,
     edge_cdf: float = 0.01,
 ) -> Tuple[str, Optional[float], Optional[float]]:
-    """Return (bias, take_profit, stop_loss) given percentile levels.
-
-    Bias is "LONG", "SHORT", or "NEUTRAL".  The tolerance ``tol`` is a
-    threshold for how far the median can deviate from spot before
-    triggering a directional bias.  ``cdf_at_spot`` (the probability mass
-    below spot) is used to determine bias when an edge exists; if there is
-    ≥ ``edge_cdf`` mass imbalance, the side with more mass becomes the
-    bias.  If no directional rule triggers, a fallback chooses the side
-    based on whether the median is slightly above or below spot.  TP and
-    SL are set at the 25th/75th and 5th/95th percentiles, respectively.
-    """
+    """Return (bias, take_profit, stop_loss) given percentile levels."""
     # Probability mass rule
     if cdf_at_spot is not None:
         if cdf_at_spot >= 0.5 + edge_cdf:
@@ -502,29 +601,25 @@ def suggest_trade_levels(
     return ("SHORT", p25, p95) if (spot - p50) > 0 else ("LONG", p75, p05)
 
 
-# ---------------------------------------------------------------------------
+###############################################################################
 # Plot and guard integration
-# ---------------------------------------------------------------------------
+###############################################################################
 
 def build_daily_bell_and_guard(
     guard: DailyRiskGuard,
     start_equity_today: Optional[float] = None,
-    position: Optional[BTCPosition] = None,
+    position: Optional[object] = None,
     risk_free_rate: float = 0.0,
     strike_window_pct: float = 0.40,
     min_calls: int = 16,
     bell_sigma_pts: float = 4.0,
     save_png: Optional[str] = None,
 ) -> Dict[str, float]:
-    """Compute and plot the risk‑neutral PDF and update the risk guard.
-
-    Returns a summary dict containing spot price, percentile levels,
-    bias, TP/SL, and risk guard state.  The PDF plot is displayed via
-    matplotlib and optionally saved.
-    """
+    """Compute and plot the risk‑neutral PDF and update the risk guard."""
     if start_equity_today is not None:
         guard.set_start_equity(start_equity_today)
 
+    # Fetch spot and option chain
     S0 = fetch_btc_spot()
     exp_ms, calls, puts = choose_good_expiry(min_calls=min_calls)
     T = time_to_expiry_years(exp_ms)
@@ -548,8 +643,11 @@ def build_daily_bell_and_guard(
     # Percentiles and probability mass at spot
     p05 = percentile_level(x, cdf, 0.05)
     p25 = percentile_level(x, cdf, 0.25)
+    p30 = percentile_level(x, cdf, 0.30)
     p50 = percentile_level(x, cdf, 0.50)
+    p70 = percentile_level(x, cdf, 0.70)
     p75 = percentile_level(x, cdf, 0.75)
+    p90 = percentile_level(x, cdf, 0.90)
     p95 = percentile_level(x, cdf, 0.95)
     cdf_at_spot = float(np.interp(S0, x, cdf))
 
@@ -562,7 +660,10 @@ def build_daily_bell_and_guard(
 
     # Update risk guard with unrealized PnL from open position
     if position is not None:
-        upl = position.upl(S0)
+        try:
+            upl = position.upl(S0)
+        except Exception:
+            upl = 0.0
         guard.set_unrealized_pnl(upl)
         guard.check_lock()
 
@@ -574,10 +675,13 @@ def build_daily_bell_and_guard(
                      label=f"25–75%: ${p25:,.0f}–${p75:,.0f}")
     plt.plot(x, pdf, linewidth=1.6)
 
-    def vline(xv: float, ls: str, text: str) -> None:
-        plt.axvline(xv, linestyle=ls, linewidth=1.6, alpha=0.9)
-        plt.text(xv, plt.ylim()[1] * 0.92, text, rotation=90, va="top", ha="right")
+    # Helper for vertical lines with annotation
+    def vline(xv: float, ls: str, text: str, color: str = 'black') -> None:
+        plt.axvline(xv, linestyle=ls, linewidth=1.6, alpha=0.9, color=color)
+        ymax = plt.ylim()[1]
+        plt.text(xv, ymax * 0.92, text, rotation=90, va="top", ha="right")
 
+    # Core annotations: median, spot, TP/SL
     vline(p50, "--", f"Median ${p50:,.0f}")
     plt.axvline(S0, color="k", linewidth=1.2, alpha=0.6)
     plt.text(S0, plt.ylim()[1] * 0.98, f"Spot ${S0:,.0f}", ha="center", va="top")
@@ -587,6 +691,11 @@ def build_daily_bell_and_guard(
             vline(tp_level, "-", f"TP ${tp_level:,.0f}")
         if sl_level is not None:
             vline(sl_level, "-", f"SL ${sl_level:,.0f}")
+
+    # Annotate 30%, 50%, 70%, and 90% cumulative probability levels
+    vline(p30, ":", f"30% chance ${p30:,.0f}", color='grey')
+    vline(p70, ":", f"70% chance ${p70:,.0f}", color='grey')
+    vline(p90, ":", f"90% chance ${p90:,.0f}", color='grey')
 
     plt.title(
         f"BTC PDF — Exp {exp_ts.strftime('%Y-%m-%d')} — Day {guard.day or guard._today_iso(guard.tz_offset_hours)}"
@@ -609,8 +718,11 @@ def build_daily_bell_and_guard(
         "spot": S0,
         "p05": p05,
         "p25": p25,
+        "p30": p30,
         "p50": p50,
+        "p70": p70,
         "p75": p75,
+        "p90": p90,
         "p95": p95,
         "bias": bias,
         "tp": tp_level,
@@ -622,9 +734,9 @@ def build_daily_bell_and_guard(
     }
 
 
-# ---------------------------------------------------------------------------
+###############################################################################
 # Signal log and grading
-# ---------------------------------------------------------------------------
+###############################################################################
 
 def _append_signal(rec: dict) -> None:
     with open(SIGNALS_PATH, "a") as f:
@@ -666,15 +778,7 @@ def grade_signal_with_next_day(
     within_pct: float = 0.10,
     count_median_touch: bool = True,
 ) -> dict:
-    """Grade a signal by inspecting the next day's BTC price path.
-
-    This function attempts to retrieve 30‑minute bars for BTC‑USD from
-    Yahoo Finance via yfinance.  If the next day is in the future or
-    data are unavailable, the record is left pending.  Primary rule:
-    whichever of TP or SL is hit first sets WIN or LOSS.  Secondary
-    rules award a WIN if the median is touched, or if price gets
-    within a specified percentage of TP in the favourable direction.
-    """
+    """Grade a signal by inspecting the next day's BTC price path."""
     if rec.get("bias") == "NEUTRAL" or rec.get("tp") is None or rec.get("sl") is None:
         rec["graded"] = True
         rec["result"] = "SKIP"
@@ -817,37 +921,10 @@ def summarize_results(last_n: int = 30) -> Dict[str, int]:
     return counts
 
 
-# ---------------------------------------------------------------------------
-# Predicted vs Actual Price Table
-# ---------------------------------------------------------------------------
-def compute_predicted_actual_table(last_n: int = 30) -> Optional[pd.DataFrame]:
-    """Return a DataFrame comparing each signal's predicted median to the actual
-    closing price from a local CSV file.
-
-    The function looks up actual closing prices in ``BTC_PRICE_CSV`` (a
-    CSV downloaded from FRED for the series CBBTCUSD).  It matches the
-    ``day`` field from each signal against the ``observation_date`` in the
-    CSV, returning a DataFrame with the columns:
-
-    - ``day``: the Arizona trading day (ISO date string)
-    - ``predicted_median``: the median (50th percentile) predicted by the PDF
-    - ``actual_price``: the BTC close from the CSV on that date, or None
-      if not available
-    - ``error``: ``actual_price`` minus ``predicted_median`` when both
-      values are available
-
-    Parameters
-    ----------
-    last_n : int, optional
-        Number of most recent signals to include (default 30).
-
-    Returns
-    -------
-    pandas.DataFrame or None
-        Returns a DataFrame if pandas and the CSV file are available;
-        otherwise returns None and prints a warning.
+def compute_predicted_actual_table(last_n: int = 30) -> Optional[object]:
+    """Return a DataFrame (or None) comparing each signal's predicted median to actual closing prices.
+    Uses a local CSV file with historical BTC prices (CBBTCUSD.csv) if available.
     """
-    # pandas must be available
     if pd is None:
         print("pandas is not available; cannot compute predicted vs actual table.")
         return None
@@ -855,7 +932,6 @@ def compute_predicted_actual_table(last_n: int = 30) -> Optional[pd.DataFrame]:
     if not recs:
         return pd.DataFrame(columns=["day", "predicted_median", "actual_price", "error"])
     recs = recs[-last_n:]
-    # Ensure the CSV file exists
     if not os.path.exists(BTC_PRICE_CSV):
         print(f"Price CSV '{BTC_PRICE_CSV}' not found; cannot compute actual prices.")
         return None
@@ -867,7 +943,6 @@ def compute_predicted_actual_table(last_n: int = 30) -> Optional[pd.DataFrame]:
     if 'observation_date' not in price_df.columns or 'CBBTCUSD' not in price_df.columns:
         print(f"{BTC_PRICE_CSV} must contain 'observation_date' and 'CBBTCUSD' columns.")
         return None
-    # Convert dates
     price_df['observation_date'] = pd.to_datetime(price_df['observation_date'])
     price_df = price_df[['observation_date', 'CBBTCUSD']].dropna(subset=['CBBTCUSD'])
     rows = []
@@ -898,10 +973,7 @@ def compute_predicted_actual_table(last_n: int = 30) -> Optional[pd.DataFrame]:
     return pd.DataFrame(rows)
 
 
-# ---------------------------------------------------------------------------
 # Main entry point
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     # Example configuration: adjust as needed
     DAILY_LOSS_LIMIT = 2500.0
@@ -971,34 +1043,23 @@ if __name__ == "__main__":
     print(f"Rolling 30-signal win rate: {wins}/{total} = {wr:.1%}")
     print(f"Last 30 results breakdown: {breakdown}")
 
-    # ------------------------------------------------------------------
     # Predicted vs Actual Table
-    #
-    # If pandas is available and a price CSV is present, compute a table
-    # that pairs each of the most recent signals (up to 30) with the
-    # actual closing price on that day.  This helps assess whether the
-    # predicted median was accurate.  If data are missing or the CSV is
-    # not present, the table will be omitted.
     try:
         pred_table = compute_predicted_actual_table(last_n=30)
     except Exception as e:
         pred_table = None
         print(f"Error computing predicted vs actual table: {e}")
 
-    if pred_table is not None and not pred_table.empty:
+    if pred_table is not None and hasattr(pred_table, 'empty') and not pred_table.empty:
         print("\nPredicted vs Actual (last 30 signals):")
-        # Format the DataFrame for display: limit float precision and sort by day
         try:
             display_df = pred_table.copy()
-            # Round the error to 2 decimals if present
             if 'error' in display_df.columns:
                 display_df['error'] = display_df['error'].map(lambda x: f"{x:,.2f}" if x is not None else "")
-            # Format numbers with commas and zero decimals
             if 'predicted_median' in display_df.columns:
                 display_df['predicted_median'] = display_df['predicted_median'].map(lambda x: f"{x:,.0f}" if x is not None else "")
             if 'actual_price' in display_df.columns:
                 display_df['actual_price'] = display_df['actual_price'].map(lambda x: f"{x:,.0f}" if x is not None else "")
             print(display_df.to_string(index=False))
-        except Exception as e:
-            # Fallback simple print if formatting fails
+        except Exception:
             print(pred_table)
