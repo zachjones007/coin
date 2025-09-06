@@ -1,0 +1,91 @@
+//@version=5
+indicator("Candle Momentum with Wick Filter", overlay=true)
+
+// ── Inputs
+momLen      = input.int(5,  "Momentum lookback (bars)", minval=1)
+smooth      = input.int(3,  "Smoothing EMA", minval=1)
+atrLen      = input.int(14, "ATR length", minval=1)
+stdevLen    = input.int(50, "Adaptive window (stdev of momentum)", minval=10)
+weakK       = input.float(0.8, "Weak threshold × stdev", step=0.05)
+strongK     = input.float(1.6, "Strong threshold × stdev", step=0.05)
+
+useTrend    = input.bool(true, "Trend filter (EMA fast > slow = bull, fast < slow = bear)")
+fastEMA     = input.int(20, "Trend fast EMA", minval=1)
+slowEMA     = input.int(50, "Trend slow EMA", minval=2)
+
+wickRatio   = input.float(2.0, "Max Wick-to-Body Ratio", minval=1.0)
+
+// ── Momentum (ATR-normalized)
+atrVal   = ta.atr(atrLen)
+atrSafe  = na(atrVal) or atrVal == 0.0 ? 1e-10 : atrVal
+delta    = close - close[momLen]
+normMom  = delta / atrSafe
+momSm    = ta.ema(normMom, smooth)
+
+// Adaptive thresholds
+momDev   = ta.stdev(momSm, stdevLen)
+devSafe  = na(momDev) or momDev == 0.0 ? 1e-10 : momDev
+weakUp   =  weakK  * devSafe
+strongUp =  strongK * devSafe
+weakDn   = -weakK  * devSafe
+strongDn = -strongK * devSafe
+
+// Trend filter
+emaF   = ta.ema(close, fastEMA)
+emaS   = ta.ema(close, slowEMA)
+bullOK = not useTrend or emaF > emaS
+bearOK = not useTrend or emaF < emaS
+
+// ── Wick Filter
+bodySize = math.abs(close - open)
+upperWick = high - math.max(close, open)
+lowerWick = math.min(close, open) - low
+maxWick = math.max(upperWick, lowerWick)
+wickToBodyRatio = maxWick / bodySize
+validCandle = wickToBodyRatio < wickRatio and bodySize > 0
+
+// ── State machine
+var int state = 0
+
+if validCandle
+    if bullOK
+        if momSm > strongUp
+            state := 2
+        else if momSm > weakUp and state <= 0
+            state := 1
+    if bearOK
+        if momSm < strongDn
+            state := -2
+        else if momSm < weakDn and state >= 0
+            state := -1
+
+    // Relax transitions
+    if state == 2 and momSm < weakUp
+        state := 1
+    if state == -2 and momSm > weakDn
+        state := -1
+    if state == 1 and momSm < 0
+        state := -1
+    if state == -1 and momSm > 0
+        state := 1
+else
+    state := 0  // neutral if candle is invalid
+
+// ── Colors
+colStrongUp   = color.rgb(  0, 102, 255) // blue
+colModUp      = color.rgb(  0, 255, 255) // cyan
+colStrongDown = color.rgb(255,   0,   0) // red
+colModDown    = color.rgb(255, 215,   0) // yellow
+colNeutral    = color.gray
+
+// ── Assign final color
+barCol = state ==  2 ? colStrongUp   :
+         state ==  1 ? colModUp      :
+         state == -2 ? colStrongDown :
+         state == -1 ? colModDown    :
+                       colNeutral
+
+// ── Apply colors
+barcolor(barCol)
+plotcandle(open, high, low, close,
+           color=barCol, wickcolor=barCol, bordercolor=barCol)
