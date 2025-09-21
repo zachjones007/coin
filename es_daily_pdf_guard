@@ -1,0 +1,849 @@
+"""
+es_daily_pdf_guard
+-------------------
+
+This module is an adaptation of the original ``btc_daily_pdf_guard_backtest``
+script to work with E‑mini S&P 500 futures (ES).  The core logic remains
+unchanged: it attempts to construct a risk‑neutral probability density
+function (PDF) from option prices and provides a simple risk guard for
+intraday trading.  However, in contrast to the Bitcoin implementation,
+there is no public Deribit–like API for ES options available in this
+environment.  Therefore, the functions that fetch spot prices and option
+chains are implemented as best‑effort placeholders.  When network
+requests fail or no data are available, the script falls back to a
+synthetic normal distribution centred on the current spot price.
+
+To adapt this module for live trading, users must supply their own
+implementations of ``fetch_es_spot``, ``list_es_expiries`` and
+``fetch_es_chain`` that return accurate and timely market data.  These
+functions are intentionally designed to raise exceptions by default so
+that the synthetic fallback triggers, making the script usable without
+external dependencies.
+
+Usage
+-----
+
+Run this script once per trading day to generate the PDF, log the
+signal, and grade previous signals.  See the original
+``btc_daily_pdf_guard_backtest`` for a detailed description of the
+functionality.
+
+Note
+----
+
+The default implementation of ``fetch_es_spot`` attempts to query
+Yahoo Finance for the current ES futures price via the public quote API.
+This may not work in restricted environments; if the request fails,
+``S0 = 1.0`` is used as a final fallback anchor.  Similarly,
+``list_es_expiries`` and ``fetch_es_chain`` raise ``NotImplementedError``
+to force the synthetic fallback path when they are not overridden.
+"""
+
+from __future__ import annotations
+
+import os
+import json
+import time
+import math
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import requests
+import matplotlib.pyplot as plt
+from scipy.interpolate import UnivariateSpline
+
+try:
+    import pandas as pd  # type: ignore
+except ImportError:
+    pd = None  # type: ignore
+
+# ============================================================================
+# Data model and guard (copied from the BTC version)
+# ============================================================================
+
+@dataclass
+class QuoteRow:
+    """A container for a single option quote.
+
+    Attributes
+    ----------
+    K : float
+        The option strike price.
+    mid : float
+        The mid price between bid and ask for the option.
+    """
+
+    K: float
+    mid: float
+
+
+@dataclass
+class DailyRiskGuard:
+    """Tracks daily PnL and locks trading when a loss limit is exceeded."""
+
+    daily_loss_limit: float
+    include_unrealized: bool = True
+    tz_offset_hours: int = -7  # Arizona (no DST)
+    day: str = ""
+    day_start_equity: Optional[float] = None
+    day_high_equity: Optional[float] = None
+    realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
+    locked: bool = False
+
+    @staticmethod
+    def _today_iso(tz_offset_hours: int) -> str:
+        return (datetime.utcnow() + timedelta(hours=tz_offset_hours)).date().isoformat()
+
+    def _ensure_day(self) -> None:
+        today = self._today_iso(self.tz_offset_hours)
+        if self.day != today:
+            self.reset_day(self.day_start_equity)
+
+    def reset_day(self, start_equity: Optional[float] = None) -> None:
+        """Reset the guard at the start of a new day."""
+        self.day = self._today_iso(self.tz_offset_hours)
+        self.locked = False
+        self.realized_pnl = 0.0
+        self.unrealized_pnl = 0.0
+        if start_equity is not None:
+            self.day_start_equity = start_equity
+        self.day_high_equity = self.day_start_equity
+
+    def set_start_equity(self, equity: float) -> None:
+        self._ensure_day()
+        self.day_start_equity = equity
+        self.day_high_equity = equity
+
+    def add_realized_pnl(self, pnl: float) -> None:
+        self._ensure_day()
+        if not self.locked:
+            self.realized_pnl += pnl
+            self._update_high()
+
+    def set_unrealized_pnl(self, upl: float) -> None:
+        self._ensure_day()
+        self.unrealized_pnl = upl if self.include_unrealized else 0.0
+        self._update_high()
+
+    def _update_high(self) -> None:
+        if self.day_start_equity is None:
+            return
+        eq_now = self.day_start_equity + self.realized_pnl + self.unrealized_pnl
+        if self.day_high_equity is None or eq_now > self.day_high_equity:
+            self.day_high_equity = eq_now
+
+    def _drawdown_from_start(self) -> float:
+        if self.day_start_equity is None:
+            return max(0.0, -(self.realized_pnl + self.unrealized_pnl))
+        eq_now = self.day_start_equity + self.realized_pnl + self.unrealized_pnl
+        return max(0.0, self.day_start_equity - eq_now)
+
+    def check_lock(self) -> bool:
+        self._ensure_day()
+        if self._drawdown_from_start() >= self.daily_loss_limit:
+            self.locked = True
+        return self.locked
+
+
+# ============================================================================
+# ES data fetchers (placeholder implementations)
+# ============================================================================
+
+def fetch_es_spot() -> float:
+    """Return the ES futures index price.
+
+    This function attempts to query Yahoo Finance for the latest ES futures
+    price via its public quote API.  If the request fails or the
+    environment blocks internet access, a ``RuntimeError`` is raised so that
+    the caller can fall back to a synthetic distribution.
+    """
+    # Yahoo Finance quote endpoint for ES futures (symbol "ES=F").  The
+    # response contains a JSON object with a list of quotes under
+    # ``quoteResponse.result``.  If the call fails (e.g. due to network
+    # restrictions), we raise an exception.
+    url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=ES=F"
+    try:
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        result = data.get("quoteResponse", {}).get("result", [])
+        if not result:
+            raise RuntimeError("No result in Yahoo quote response")
+        price = result[0].get("regularMarketPrice")
+        if price is None or not math.isfinite(price):
+            raise RuntimeError("Invalid price in Yahoo quote response")
+        return float(price)
+    except Exception as e:
+        # propagate the error so the caller can handle it
+        raise RuntimeError(f"Failed to fetch ES spot price: {e}")
+
+
+def list_es_expiries() -> List[int]:
+    """Return a list of upcoming ES option expiry timestamps in ms.
+
+    This placeholder implementation raises ``NotImplementedError``.  Users
+    should override this function to return a sorted list of UNIX
+    timestamps (in milliseconds) representing the expiry dates of ES
+    options.  Without a working implementation the synthetic fallback
+    path will always be used.
+    """
+    raise NotImplementedError("Listing ES expiries is not implemented."
+                              " Please provide your own implementation.")
+
+
+def fetch_es_chain(exp_ms: int) -> Tuple[List[QuoteRow], List[QuoteRow]]:
+    """Return (call_list, put_list) of QuoteRow for a given ES expiry.
+
+    Like ``list_es_expiries``, this function must be supplied by the user
+    to return actual option quotes.  The default implementation raises
+    ``NotImplementedError`` to force the synthetic fallback.
+    """
+    raise NotImplementedError("Fetching ES option chains is not implemented."
+                              " Please provide your own implementation.")
+
+
+def time_to_expiry_years(exp_ms: int) -> float:
+    """Time to expiry in years from now, given expiry in ms."""
+    now = datetime.now(tz=timezone.utc).timestamp()
+    return max(1e-6, (exp_ms / 1000.0 - now) / (365.25 * 24 * 3600))
+
+
+def calls_from_puts_via_parity(
+    puts: List[QuoteRow], S0: float, K: np.ndarray, r: float, T: float, q: float = 0.0
+) -> Dict[float, float]:
+    """Convert put mids to call mids using put‑call parity: C = P + S*e^{-qT} − K*e^{-rT}."""
+    disc_S = math.exp(-q * T)
+    disc_K = math.exp(-r * T)
+    pm = {row.K: row.mid for row in puts}
+    out: Dict[float, float] = {}
+    for k in K:
+        p = pm.get(float(k))
+        if p is not None:
+            out[float(k)] = max(0.0, float(p + S0 * disc_S - k * disc_K))
+    return out
+
+
+def build_call_curve(
+    calls: List[QuoteRow],
+    puts: List[QuoteRow],
+    S0: float,
+    r: float,
+    T: float,
+    strike_window: Tuple[float, float],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return a sorted strike array and corresponding call mids."""
+    Ks_calls = np.array([c.K for c in calls], float)
+    Cs_calls = np.array([c.mid for c in calls], float)
+    all_K = np.unique(np.concatenate([Ks_calls, np.array([p.K for p in puts], float)]))
+    parity_calls = calls_from_puts_via_parity(puts, S0, all_K, r=r, T=T)
+
+    merged: Dict[float, float] = {}
+    idx_map = {k: i for i, k in enumerate(Ks_calls.tolist())}
+    for k in all_K:
+        kf = float(k)
+        if kf in idx_map:
+            merged[kf] = float(Cs_calls[idx_map[kf]])
+        elif kf in parity_calls:
+            merged[kf] = parity_calls[kf]
+
+    k_lo, k_hi = strike_window
+    items = [(k, v) for k, v in merged.items() if k_lo <= k <= k_hi and math.isfinite(v)]
+    if not items:
+        raise RuntimeError("No strikes after windowing/merge.")
+    items.sort(key=lambda t: t[0])
+    K_arr = np.array([k for k, _ in items], float)
+    C_arr = np.maximum(np.array([v for _, v in items], float), 0.0)
+    return K_arr, C_arr
+
+
+def bl_pdf_from_calls(
+    strikes: np.ndarray,
+    call_mids: np.ndarray,
+    r: float,
+    T: float,
+    smoothing_scale: float = 1e-3,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute the Breeden–Litzenberger PDF: f(K) = e^{rT} * d²C/dK²."""
+    n = len(strikes)
+    if n < 8:
+        raise RuntimeError(f"Too few strikes ({n}) to compute PDF.")
+    s = max(1e-6, n * smoothing_scale * (1.5 if n < 18 else 1.0))
+    spline = UnivariateSpline(strikes, call_mids, k=3, s=s)
+    c2 = spline.derivative(2)(strikes)
+    pdf = np.exp(r * T) * np.maximum(c2, 0.0)
+    area = np.trapz(pdf, strikes)
+    if area > 0:
+        pdf /= area
+    return strikes, pdf
+
+
+def gaussian_smooth(y: np.ndarray, sigma_pts: float = 4.0) -> np.ndarray:
+    """Apply a Gaussian kernel to smooth the PDF."""
+    if sigma_pts <= 0:
+        return y
+    radius = int(max(3, round(6 * sigma_pts)))
+    x = np.arange(-radius, radius + 1, dtype=float)
+    kern = np.exp(-(x ** 2) / (2 * sigma_pts ** 2))
+    kern /= kern.sum()
+    return np.convolve(y, kern, mode="same")
+
+
+def cdf_from_pdf(x: np.ndarray, pdf: np.ndarray) -> np.ndarray:
+    """Compute the cumulative distribution function from the PDF."""
+    dx = np.diff(x).mean()
+    return np.clip(np.cumsum(pdf) * dx, 0.0, 1.0)
+
+
+def percentile_level(x: np.ndarray, cdf: np.ndarray, p: float) -> float:
+    """Return the value K such that P(X <= K) = p."""
+    return float(np.interp(p, cdf, x))
+
+
+def suggest_trade_levels(
+    spot: float,
+    p05: float,
+    p25: float,
+    p50: float,
+    p75: float,
+    p95: float,
+    tol: float = 0.002,
+    cdf_at_spot: Optional[float] = None,
+    edge_cdf: float = 0.01,
+) -> Tuple[str, Optional[float], Optional[float]]:
+    """Return (bias, take_profit, stop_loss) given percentile levels."""
+    if cdf_at_spot is not None:
+        if cdf_at_spot >= 0.5 + edge_cdf:
+            return "SHORT", p25, p95
+        if cdf_at_spot <= 0.5 - edge_cdf:
+            return "LONG", p75, p05
+    if p50 < spot * (1 - tol):
+        return "SHORT", p25, p95
+    if p50 > spot * (1 + tol):
+        return "LONG", p75, p05
+    return ("SHORT", p25, p95) if (spot - p50) > 0 else ("LONG", p75, p05)
+
+
+def build_daily_bell_and_guard_es(
+    guard: DailyRiskGuard,
+    start_equity_today: Optional[float] = None,
+    position: Optional[object] = None,
+    risk_free_rate: float = 0.0,
+    strike_window_pct: float = 0.40,
+    min_calls: int = 16,
+    bell_sigma_pts: float = 4.0,
+    save_png: Optional[str] = None,
+) -> Dict[str, float]:
+    """Compute and plot the risk‑neutral PDF for ES and update the risk guard.
+
+    The function first tries to fetch real ES option data.  If any part of
+    the data retrieval fails (due to missing implementations or network
+    errors), it falls back to a synthetic normal distribution centred
+    around the current spot price.  In either case, the resulting PDF
+    is smoothed, percentiles are computed, and trade levels are
+    suggested.  The risk guard is updated based on any open position
+    provided.
+    """
+    if start_equity_today is not None:
+        guard.set_start_equity(start_equity_today)
+
+    use_synthetic = False
+
+    try:
+        # ----- Real options path -----
+        S0 = fetch_es_spot()
+        exp_ms_list = list_es_expiries()
+        if not exp_ms_list:
+            raise RuntimeError("No ES expiries available")
+        # pick the nearest expiry with at least min_calls quotes
+        chosen_exp = None
+        chosen_calls: List[QuoteRow] = []
+        chosen_puts: List[QuoteRow] = []
+        for exp in exp_ms_list:
+            calls, puts = fetch_es_chain(exp)
+            if len(calls) >= min_calls:
+                chosen_exp = exp
+                chosen_calls = calls
+                chosen_puts = puts
+                break
+        if chosen_exp is None:
+            # fallback: choose the first available expiry even if sparse
+            chosen_exp = exp_ms_list[0]
+            chosen_calls, chosen_puts = fetch_es_chain(chosen_exp)
+        T = time_to_expiry_years(chosen_exp)
+        exp_ts = datetime.fromtimestamp(chosen_exp / 1000.0, tz=timezone.utc)
+        # Build call curve within ±strike_window_pct around spot
+        k_lo, k_hi = (1.0 - strike_window_pct) * S0, (1.0 + strike_window_pct) * S0
+        K, C = build_call_curve(chosen_calls, chosen_puts, S0, r=risk_free_rate, T=T, strike_window=(k_lo, k_hi))
+        # Densify strike grid and compute PDF via BL
+        grid = np.linspace(K.min(), K.max(), 900)
+        pre = UnivariateSpline(K, C, k=3, s=max(1e-6, len(K) * 1e-3))
+        Cg = pre(grid)
+        x, pdf = bl_pdf_from_calls(grid, Cg, r=risk_free_rate, T=T, smoothing_scale=1e-3)
+        pdf = gaussian_smooth(pdf, sigma_pts=bell_sigma_pts)
+        area = np.trapz(pdf, x)
+        if area > 0:
+            pdf /= area
+        cdf = cdf_from_pdf(x, pdf)
+    except Exception:
+        # ----- Synthetic fallback path (no network/data) -----
+        use_synthetic = True
+        try:
+            S0 = fetch_es_spot()
+        except Exception:
+            S0 = 1.0  # final fallback anchor
+        exp_ts = datetime.utcnow().replace(tzinfo=timezone.utc)
+        # 30% "vol" around S0 for a visible bell curve
+        sigma = abs(S0) * 0.30 if abs(S0) > 0 else 1.0
+        x = np.linspace(S0 - 4.0 * sigma, S0 + 4.0 * sigma, 900)
+        pdf = np.exp(-((x - S0) ** 2) / (2 * sigma ** 2))
+        pdf /= np.trapz(pdf, x)
+        cdf = np.cumsum(pdf) * (x[1] - x[0])
+
+    # Percentiles & mass at spot
+    p05 = percentile_level(x, cdf, 0.05)
+    p10 = percentile_level(x, cdf, 0.10)
+    p25 = percentile_level(x, cdf, 0.25)
+    p30 = percentile_level(x, cdf, 0.30)
+    p50 = percentile_level(x, cdf, 0.50)
+    p70 = percentile_level(x, cdf, 0.70)
+    p75 = percentile_level(x, cdf, 0.75)
+    p90 = percentile_level(x, cdf, 0.90)
+    p95 = percentile_level(x, cdf, 0.95)
+    cdf_at_spot = float(np.interp(S0, x, cdf))
+
+    # Bias/TP/SL
+    bias, tp_level, sl_level = suggest_trade_levels(
+        S0, p05, p25, p50, p75, p95,
+        tol=0.002,
+        cdf_at_spot=cdf_at_spot,
+        edge_cdf=0.01,
+    )
+
+    # Risk guard update
+    if position is not None:
+        try:
+            upl = position.upl(S0)
+        except Exception:
+            upl = 0.0
+        guard.set_unrealized_pnl(upl)
+        guard.check_lock()
+
+    # -------- Plot --------
+    plt.figure(figsize=(10, 6))
+    # Shaded bands
+    plt.fill_between(x, pdf, 0, where=(x >= p05) & (x <= p95), alpha=0.20,
+                     label=f"5–95%: {p05:,.0f}–{p95:,.0f}")
+    plt.fill_between(x, pdf, 0, where=(x >= p25) & (x <= p75), alpha=0.35,
+                     label=f"25–75%: {p25:,.0f}–{p75:,.0f}")
+    # Curve
+    plt.plot(x, pdf, linewidth=1.6)
+
+    def vline(xv: float, ls: str, text: str, color: str = 'black') -> None:
+        plt.axvline(xv, linestyle=ls, linewidth=1.6, alpha=0.9, color=color)
+        ymax = plt.ylim()[1]
+        plt.text(xv, ymax * 0.92, text, rotation=90, va="top", ha="right")
+
+    # Median & spot
+    vline(p50, "--", f"Median {p50:,.0f}")
+    plt.axvline(S0, color="k", linewidth=1.2, alpha=0.6)
+    plt.text(S0, plt.ylim()[1] * 0.98, f"Spot {S0:,.0f}", ha="center", va="top")
+
+    # TP/SL
+    if bias != "NEUTRAL":
+        if tp_level is not None:
+            vline(tp_level, "-", f"TP {tp_level:,.0f}")
+        if sl_level is not None:
+            vline(sl_level, "-", f"SL {sl_level:,.0f}")
+
+    # Inverted probability labels
+    vline(p10, ":", f"90% chance {p10:,.0f}", color='grey')
+    vline(p30, ":", f"70% chance {p30:,.0f}", color='grey')
+    vline(p70, ":", f"30% chance {p70:,.0f}", color='grey')
+    vline(p90, ":", f"10% chance {p90:,.0f}", color='grey')
+
+    src = "Synthetic" if use_synthetic else "Options"
+    plt.title(f"ES PDF — {src} — Exp {exp_ts.strftime('%Y-%m-%d')} — Day {guard.day or guard._today_iso(guard.tz_offset_hours)}")
+    plt.xlabel("ES price (USD)")
+    plt.ylabel("Probability density (relative likelihood)")
+    plt.grid(True, alpha=0.25)
+    plt.legend(loc="upper right", frameon=True)
+    # Keep x-limits tight to the support of the curve
+    support_mask = pdf > pdf.max() * 0.002
+    if support_mask.any():
+        xmin, xmax = x[support_mask][0], x[support_mask][-1]
+        span = xmax - xmin
+        plt.xlim(xmin - 0.05 * span, xmax + 0.05 * span)
+    plt.tight_layout()
+    if save_png:
+        plt.savefig(save_png, dpi=150)
+    plt.show()
+
+    return {
+        "spot": S0,
+        "p05": p05,
+        "p10": p10,
+        "p25": p25,
+        "p30": p30,
+        "p50": p50,
+        "p70": p70,
+        "p75": p75,
+        "p90": p90,
+        "p95": p95,
+        "bias": bias,
+        "tp": tp_level,
+        "sl": sl_level,
+        "locked": guard.locked,
+        "drawdown_from_start": guard._drawdown_from_start(),
+        "realized_pnl": guard.realized_pnl,
+        "unrealized_pnl": guard.unrealized_pnl,
+    }
+
+
+###############################################################################
+# Persistence helpers (copied verbatim)
+###############################################################################
+
+STATE_PATH = "es_daily_guard_state.json"
+SIGNALS_PATH = "es_daily_signals.jsonl"
+BTC_PRICE_CSV = "CBBTCUSD.csv"  # unused here, kept for compatibility
+
+
+def load_guard(path: str) -> Optional[DailyRiskGuard]:
+    """Load a DailyRiskGuard from a JSON file, if it exists."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            d = json.load(f)
+        return DailyRiskGuard(**d)
+    except Exception:
+        return None
+
+
+def save_guard(path: str, guard: DailyRiskGuard) -> None:
+    """Save a DailyRiskGuard to a JSON file."""
+    try:
+        with open(path, "w") as f:
+            json.dump(asdict(guard), f, indent=2)
+    except Exception:
+        pass
+
+
+###############################################################################
+# Signal log and grading (copied and lightly adjusted)
+###############################################################################
+
+def _append_signal(rec: dict) -> None:
+    with open(SIGNALS_PATH, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def _read_signals() -> List[dict]:
+    if not os.path.exists(SIGNALS_PATH):
+        return []
+    out: List[dict] = []
+    with open(SIGNALS_PATH, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            out.append(json.loads(line))
+    return out
+
+
+def _write_signals(allrecs: List[dict]) -> None:
+    with open(SIGNALS_PATH, "w") as f:
+        for rec in allrecs:
+            f.write(json.dumps(rec) + "\n")
+
+
+def az_day_bounds(iso_date: str, tz_offset_hours: int = -7) -> Tuple[datetime, datetime]:
+    """Return UTC start/end covering the given Arizona date."""
+    local_start = datetime.fromisoformat(iso_date)
+    utc_start = datetime(
+        local_start.year, local_start.month, local_start.day, tzinfo=timezone.utc
+    ) - timedelta(hours=tz_offset_hours)
+    utc_end = utc_start + timedelta(days=1)
+    return utc_start, utc_end
+
+
+def grade_signal_with_next_day(
+    rec: dict,
+    tz_offset_hours: int = -7,
+    within_pct: float = 0.10,
+    count_median_touch: bool = True,
+) -> dict:
+    """Grade a signal by inspecting the next day's ES price path.
+
+    This grading function behaves identically to the BTC version but uses
+    Yahoo Finance's ES future symbol (ES=F) for price retrieval.  Since
+    yfinance may not be installed or network access may be restricted, the
+    function falls back to marking the signal as "PENDING" when data are
+    unavailable.
+    """
+    if rec.get("bias") == "NEUTRAL" or rec.get("tp") is None or rec.get("sl") is None:
+        rec["graded"] = True
+        rec["result"] = "SKIP"
+        return rec
+    d = datetime.fromisoformat(rec["day"])
+    next_day_iso = (d + timedelta(days=1)).date().isoformat()
+    start_utc, end_utc = az_day_bounds(next_day_iso, tz_offset_hours)
+    now_utc = datetime.now(timezone.utc)
+    if start_utc > now_utc:
+        rec["graded"] = False
+        rec["result"] = "PENDING"
+        rec["note"] = "Next-day window not available yet"
+        return rec
+    effective_end = min(end_utc, now_utc)
+    if pd is None:
+        rec["graded"] = False
+        rec["result"] = "PENDING"
+        rec["note"] = "pandas unavailable"
+        return rec
+    # Use yfinance via pandas_datareader or read_csv from Yahoo if possible
+    try:
+        import yfinance as yf  # type: ignore
+    except Exception:
+        yf = None  # type: ignore
+    if yf is None:
+        rec["graded"] = False
+        rec["result"] = "PENDING"
+        rec["note"] = "yfinance unavailable"
+        return rec
+    try:
+        df = yf.download(
+            "ES=F",
+            start=start_utc,
+            end=effective_end,
+            interval="30m",
+            progress=False,
+            prepost=True,
+            auto_adjust=False,
+            raise_errors=False,
+            threads=False,
+        )
+    except Exception:
+        df = None
+    if df is None or df.empty:
+        rec["graded"] = False
+        rec["result"] = "PENDING"
+        rec["note"] = "No data yet"
+        return rec
+    bias = rec["bias"]
+    tp = float(rec["tp"])
+    sl = float(rec["sl"])
+    p50 = float(rec.get("median") or rec.get("p50") or 0.0)
+    result: Optional[str] = None
+    for _, row in df.iterrows():
+        high = float(row["High"])
+        low = float(row["Low"])
+        if bias == "LONG":
+            hit_tp = high >= tp
+            hit_sl = low <= sl
+        else:
+            hit_tp = low <= tp
+            hit_sl = high >= sl
+        if hit_tp and hit_sl:
+            result = "LOSS"
+            break
+        elif hit_tp:
+            result = "WIN"
+            break
+        elif hit_sl:
+            result = "LOSS"
+            break
+    if result is not None:
+        rec["graded"] = True
+        rec["result"] = result
+        return rec
+    if count_median_touch and p50 > 0:
+        touched_median = any(
+            (float(row["Low"]) <= p50 <= float(row["High"])) for _, row in df.iterrows()
+        )
+        if touched_median:
+            rec["graded"] = True
+            rec["result"] = "WIN"
+            rec["note"] = "Median-touch"
+            return rec
+    if within_pct > 0:
+        if bias == "LONG":
+            thresh = tp * (1.0 - within_pct)
+            got_close = any(float(row["High"]) >= thresh for _, row in df.iterrows())
+        else:
+            thresh = tp * (1.0 + within_pct)
+            got_close = any(float(row["Low"]) <= thresh for _, row in df.iterrows())
+        if got_close:
+            rec["graded"] = True
+            rec["result"] = "WIN"
+            rec["note"] = f"Within {within_pct:.0%} of TP"
+            return rec
+    if effective_end < end_utc:
+        rec["graded"] = False
+        rec["result"] = "PENDING"
+        rec["note"] = "Next-day still in progress"
+        return rec
+    rec["graded"] = True
+    rec["result"] = "NO_HIT"
+    return rec
+
+
+def compute_win_rate(last_n: int = 30) -> Tuple[int, int, float]:
+    """Return (#wins, #trades, win_rate) for last N graded trades."""
+    recs = _read_signals()
+    graded = [r for r in recs if r.get("graded") and r.get("result") in ("WIN", "LOSS")]
+    if not graded:
+        return 0, 0, 0.0
+    graded = graded[-last_n:]
+    wins = sum(1 for r in graded if r["result"] == "WIN")
+    total = len(graded)
+    return wins, total, (wins / total if total else 0.0)
+
+
+def summarize_results(last_n: int = 30) -> Dict[str, int]:
+    """Return a breakdown of recent results (WIN/LOSS/NO_HIT/SKIP/PENDING)."""
+    recs = _read_signals()
+    graded = [r for r in recs if r.get("graded")]
+    graded = graded[-last_n:]
+    counts: Dict[str, int] = {"WIN": 0, "LOSS": 0, "NO_HIT": 0, "SKIP": 0, "PENDING": 0}
+    for r in graded:
+        res = r.get("result") or "NO_HIT"
+        counts[res] = counts.get(res, 0) + 1
+    return counts
+
+
+def compute_predicted_actual_table(last_n: int = 30) -> Optional[object]:
+    """Return a DataFrame comparing each signal's predicted median to actual closing prices.
+
+    This helper uses the same CSV used by the BTC version (``CBBTCUSD.csv``) as a
+    placeholder for ES data.  If the CSV does not exist, None is returned.  In
+    practical deployments users should replace the CSV with a data source for
+    ES futures closing prices.
+    """
+    if pd is None:
+        print("pandas is not available; cannot compute predicted vs actual table.")
+        return None
+    recs = _read_signals()
+    if not recs:
+        return pd.DataFrame(columns=["day", "predicted_median", "actual_price", "error"])
+    recs = recs[-last_n:]
+    if not os.path.exists(BTC_PRICE_CSV):
+        print(f"Price CSV '{BTC_PRICE_CSV}' not found; cannot compute actual prices.")
+        return None
+    try:
+        price_df = pd.read_csv(BTC_PRICE_CSV)
+    except Exception as e:
+        print(f"Failed to read {BTC_PRICE_CSV}: {e}")
+        return None
+    if 'observation_date' not in price_df.columns or 'CBBTCUSD' not in price_df.columns:
+        print(f"{BTC_PRICE_CSV} must contain 'observation_date' and 'CBBTCUSD' columns.")
+        return None
+    price_df['observation_date'] = pd.to_datetime(price_df['observation_date'])
+    price_df = price_df[['observation_date', 'CBBTCUSD']].dropna(subset=['CBBTCUSD'])
+    rows = []
+    for rec in recs:
+        day = rec.get('day')
+        pred = rec.get('median') or rec.get('p50')
+        actual_price = None
+        if day:
+            try:
+                date_obj = datetime.fromisoformat(day).date()
+                mask = price_df['observation_date'].dt.date == date_obj
+                if mask.any():
+                    actual_price = float(price_df.loc[mask, 'CBBTCUSD'].iloc[0])
+            except Exception:
+                actual_price = None
+        error = None
+        try:
+            if pred is not None and actual_price is not None and np.isfinite(float(pred)) and np.isfinite(float(actual_price)):
+                error = float(actual_price) - float(pred)
+        except Exception:
+            error = None
+        rows.append({
+            'day': day,
+            'predicted_median': pred,
+            'actual_price': actual_price,
+            'error': error
+        })
+    return pd.DataFrame(rows)
+
+
+# ============================================================================
+# Main entry point
+# ============================================================================
+
+if __name__ == "__main__":
+    DAILY_LOSS_LIMIT = 2500.0
+    START_EQUITY_TODAY = 50_000.0
+    guard = load_guard(STATE_PATH) or DailyRiskGuard(daily_loss_limit=DAILY_LOSS_LIMIT, tz_offset_hours=-7)
+    guard.reset_day(start_equity=START_EQUITY_TODAY)
+    summary = build_daily_bell_and_guard_es(
+        guard=guard,
+        start_equity_today=START_EQUITY_TODAY,
+        position=None,
+        risk_free_rate=0.00,
+        strike_window_pct=0.40,
+        min_calls=16,
+        bell_sigma_pts=4.0,
+        save_png=f"es_bl_{guard.day}.png"
+    )
+    print(
+        f"AZ Day: {guard.day} | Spot {summary['spot']:,.0f} | "
+        f"Median {summary['p50']:,.0f} | 25–75% {summary['p25']:,.0f}–{summary['p75']:,.0f} | "
+        f"5–95% {summary['p05']:,.0f}–{summary['p95']:,.0f}"
+    )
+    print(
+        f"Bias: {summary['bias']} | TP: {summary['tp']} | SL: {summary['sl']} | "
+        f"PnL R:{summary['realized_pnl']:+.2f} U:{summary['unrealized_pnl']:+.2f} | "
+        f"DD: {summary['drawdown_from_start']:.2f} → {'LOCKED' if summary['locked'] else 'OK TO TRADE'}"
+    )
+    save_guard(STATE_PATH, guard)
+    signal_rec = {
+        "day": guard.day,
+        "spot": summary["spot"],
+        "median": summary["p50"],
+        "p25": summary["p25"],
+        "p75": summary["p75"],
+        "p05": summary["p05"],
+        "p95": summary["p95"],
+        "bias": summary["bias"],
+        "tp": summary["tp"],
+        "sl": summary["sl"],
+        "graded": False,
+        "result": None
+    }
+    _append_signal(signal_rec)
+    allrecs = _read_signals()
+    changed = False
+    for idx, r in enumerate(allrecs):
+        if not r.get("graded"):
+            allrecs[idx] = grade_signal_with_next_day(
+                r, tz_offset_hours=-7, within_pct=0.10, count_median_touch=True
+            )
+            changed = True
+    if changed:
+        _write_signals(allrecs)
+    wins, total, wr = compute_win_rate(last_n=30)
+    breakdown = summarize_results(last_n=30)
+    print(f"Rolling 30-signal win rate: {wins}/{total} = {wr:.1%}")
+    print(f"Last 30 results breakdown: {breakdown}")
+    try:
+        pred_table = compute_predicted_actual_table(last_n=30)
+    except Exception as e:
+        pred_table = None
+        print(f"Error computing predicted vs actual table: {e}")
+    if pred_table is not None and hasattr(pred_table, 'empty') and not pred_table.empty:
+        print("\nPredicted vs Actual (last 30 signals):")
+        try:
+            display_df = pred_table.copy()
+            if 'error' in display_df.columns:
+                display_df['error'] = display_df['error'].map(lambda x: f"{x:,.2f}" if x is not None else "")
+            if 'predicted_median' in display_df.columns:
+                display_df['predicted_median'] = display_df['predicted_median'].map(lambda x: f"{x:,.0f}" if x is not None else "")
+            if 'actual_price' in display_df.columns:
+                display_df['actual_price'] = display_df['actual_price'].map(lambda x: f"{x:,.0f}" if x is not None else "")
+            print(display_df.to_string(index=False))
+        except Exception:
+            print(pred_table)
