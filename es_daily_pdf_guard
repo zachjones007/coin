@@ -181,30 +181,97 @@ def fetch_es_spot() -> float:
         raise RuntimeError(f"Failed to fetch ES spot price: {e}")
 
 
-def get_top_forex_factory_events(num_reasons: int = 5) -> List[Dict[str, str]]:
+def get_top_forex_factory_events(num_reasons: int = 5) -> List[Dict[str, object]]:
     """Fetch and return up to ``num_reasons`` high‑impact events from Forex Factory.
 
-    The function attempts to download the weekly Forex Factory calendar in
-    JSON format from the public nfs.faireconomy.media domain.  It filters
-    for events marked with ``"impact": "High"``, sorts them by date, and
-    returns a list of dictionaries containing the event title, country,
-    date and impact.  If network access is restricted or the request
-    fails, an empty list is returned.
+    This function downloads the weekly Forex Factory calendar JSON and
+    extracts events with high impact.  For each event it attempts to
+    determine whether the news is likely bullish, bearish or neutral for
+    equities by comparing the forecast and previous values (if
+    available).  A numeric impact score is assigned (10 for High,
+    5 for Medium, 1 for Low, 0 otherwise) and multiplied by the
+    direction (+1 for bullish, -1 for bearish) to produce a rating.
+    The returned dictionaries contain the title, country, date, impact,
+    direction string, impact score, and rating.  A higher positive
+    rating suggests bullish influence, while a negative rating suggests
+    bearish influence.  If the request fails, an empty list is returned.
     """
     url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
     headers = {"User-Agent": "Mozilla/5.0"}
+
+    def parse_numeric(val: str) -> Optional[float]:
+        """Parse a numeric value from a string possibly containing %,K,M,B"""
+        if not val:
+            return None
+        try:
+            s = val.strip()
+            mul = 1.0
+            if s.endswith('%'):
+                s = s[:-1]
+            if s.endswith('K'):
+                mul = 1e3
+                s = s[:-1]
+            elif s.endswith('M'):
+                mul = 1e6
+                s = s[:-1]
+            elif s.endswith('B'):
+                mul = 1e9
+                s = s[:-1]
+            return float(s) * mul
+        except Exception:
+            return None
+
+    impact_map = {"High": 10, "Medium": 5, "Low": 1, "Holiday": 0}
     try:
         resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
         events = resp.json()
-        # Only keep events with 'High' impact
-        high_events = [e for e in events if e.get("impact") == "High"]
-        # Sort by date (string comparison on ISO format works for ordering)
-        high_events.sort(key=lambda e: e.get("date", ""))
-        return high_events[:num_reasons]
     except Exception:
-        # On failure, return empty list; caller can decide what to do
         return []
+    # Filter high impact events
+    high_events = [e for e in events if e.get("impact") == "High"]
+    # Sort by date
+    high_events.sort(key=lambda e: e.get("date", ""))
+    out: List[Dict[str, object]] = []
+    for e in high_events[:num_reasons]:
+        title = e.get("title", "")
+        country = e.get("country", "")
+        date = e.get("date", "")
+        impact = e.get("impact", "")
+        forecast = e.get("forecast", "")
+        previous = e.get("previous", "")
+        # Determine direction
+        forecast_val = parse_numeric(str(forecast))
+        prev_val = parse_numeric(str(previous))
+        direction_sign = 0
+        if forecast_val is not None and prev_val is not None:
+            if forecast_val > prev_val:
+                direction_sign = 1
+            elif forecast_val < prev_val:
+                direction_sign = -1
+            else:
+                direction_sign = 0
+        # Map to bullish/bearish
+        if direction_sign > 0:
+            direction_str = "Bullish"
+        elif direction_sign < 0:
+            direction_str = "Bearish"
+        else:
+            direction_str = "Neutral"
+        impact_score = impact_map.get(impact, 1)
+        rating = impact_score * direction_sign
+        out.append({
+            "title": title,
+            "country": country,
+            "date": date,
+            "impact": impact,
+            "direction": direction_str,
+            "impact_score": impact_score,
+            "rating": rating,
+            "forecast": forecast,
+            "previous": previous,
+        })
+    return out
 
 
 def list_es_expiries() -> List[int]:
@@ -509,6 +576,8 @@ def build_daily_bell_and_guard_es(
 
     # Fetch high‑impact Forex Factory events as reasons for market moves
     ff_reasons = get_top_forex_factory_events(num_reasons=5)
+    # Compute a full score: sum of event ratings (impact_score * direction sign)
+    full_score = sum(evt.get("rating", 0) for evt in ff_reasons)
 
     return {
         "spot": S0,
@@ -529,6 +598,7 @@ def build_daily_bell_and_guard_es(
         "realized_pnl": guard.realized_pnl,
         "unrealized_pnl": guard.unrealized_pnl,
         "ff_reasons": ff_reasons,
+        "ff_full_score": full_score,
     }
 
 
@@ -834,12 +904,26 @@ if __name__ == "__main__":
     if summary.get('ff_reasons'):
         print("\nTop high‑impact economic events (Forex Factory):")
         for evt in summary['ff_reasons']:
-            # Format date for readability (trim timezone offset)
             date_str = evt.get('date', '').split('T')[0]
             title = evt.get('title', 'Unknown')
             country = evt.get('country', '')
             impact = evt.get('impact', '')
-            print(f"- {date_str} {country}: {title} (Impact: {impact})")
+            direction = evt.get('direction', '')
+            rating = evt.get('rating', 0)
+            # Convert rating into 1–10 scale with sign for display
+            absolute = abs(rating)
+            # Represent rating as string like "7/10" with sign
+            if rating > 0:
+                rating_str = f"+{absolute}/10"
+            elif rating < 0:
+                rating_str = f"-{absolute}/10"
+            else:
+                rating_str = "0/10"
+            print(f"- {date_str} {country}: {title} (Impact: {impact}, Direction: {direction}, Rating: {rating_str})")
+        # Print full score
+        fs = summary.get('ff_full_score', 0)
+        sign = '+' if fs > 0 else ''
+        print(f"\nForex Factory full score: {sign}{fs}")
 
     save_guard(STATE_PATH, guard)
     signal_rec = {
