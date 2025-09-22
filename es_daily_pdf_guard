@@ -181,6 +181,32 @@ def fetch_es_spot() -> float:
         raise RuntimeError(f"Failed to fetch ES spot price: {e}")
 
 
+def get_top_forex_factory_events(num_reasons: int = 5) -> List[Dict[str, str]]:
+    """Fetch and return up to ``num_reasons`` high‑impact events from Forex Factory.
+
+    The function attempts to download the weekly Forex Factory calendar in
+    JSON format from the public nfs.faireconomy.media domain.  It filters
+    for events marked with ``"impact": "High"``, sorts them by date, and
+    returns a list of dictionaries containing the event title, country,
+    date and impact.  If network access is restricted or the request
+    fails, an empty list is returned.
+    """
+    url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        events = resp.json()
+        # Only keep events with 'High' impact
+        high_events = [e for e in events if e.get("impact") == "High"]
+        # Sort by date (string comparison on ISO format works for ordering)
+        high_events.sort(key=lambda e: e.get("date", ""))
+        return high_events[:num_reasons]
+    except Exception:
+        # On failure, return empty list; caller can decide what to do
+        return []
+
+
 def list_es_expiries() -> List[int]:
     """Return a list of upcoming ES option expiry timestamps in ms.
 
@@ -481,6 +507,9 @@ def build_daily_bell_and_guard_es(
         plt.savefig(save_png, dpi=150)
     plt.show()
 
+    # Fetch high‑impact Forex Factory events as reasons for market moves
+    ff_reasons = get_top_forex_factory_events(num_reasons=5)
+
     return {
         "spot": S0,
         "p05": p05,
@@ -499,6 +528,7 @@ def build_daily_bell_and_guard_es(
         "drawdown_from_start": guard._drawdown_from_start(),
         "realized_pnl": guard.realized_pnl,
         "unrealized_pnl": guard.unrealized_pnl,
+        "ff_reasons": ff_reasons,
     }
 
 
@@ -799,6 +829,18 @@ if __name__ == "__main__":
         f"PnL R:{summary['realized_pnl']:+.2f} U:{summary['unrealized_pnl']:+.2f} | "
         f"DD: {summary['drawdown_from_start']:.2f} → {'LOCKED' if summary['locked'] else 'OK TO TRADE'}"
     )
+
+    # Display top Forex Factory reasons if available
+    if summary.get('ff_reasons'):
+        print("\nTop high‑impact economic events (Forex Factory):")
+        for evt in summary['ff_reasons']:
+            # Format date for readability (trim timezone offset)
+            date_str = evt.get('date', '').split('T')[0]
+            title = evt.get('title', 'Unknown')
+            country = evt.get('country', '')
+            impact = evt.get('impact', '')
+            print(f"- {date_str} {country}: {title} (Impact: {impact})")
+
     save_guard(STATE_PATH, guard)
     signal_rec = {
         "day": guard.day,
